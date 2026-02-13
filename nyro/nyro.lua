@@ -1,5 +1,7 @@
 local ngx    = ngx
+local ipairs = ipairs
 local pairs  = pairs
+local pcall  = pcall
 local core   = require("nyro.core")
 
 -- 加载资源模块
@@ -10,80 +12,143 @@ local certificate = require("nyro.certificate")
 local consumer    = require("nyro.consumer")
 local plugin      = require("nyro.plugin")
 
+-- ============================================================
+-- 插件执行: route 级 → service 级 → 全局级
+-- ============================================================
+
 local function run_plugin(phase, oak_ctx)
-    if oak_ctx == nil or oak_ctx.config == nil then
+    local plugin_objects = plugin.plugin_subjects()
+    if not plugin_objects then
         return
     end
 
-    local config = oak_ctx.config
-
-    if not config then
-        core.log.error("run_plugin plugin data not ready!")
-        core.response.exit(500, { message = "config not ready" })
-    end
-
-    local service_router  = config.service_router
-    local service_plugins = service_router.plugins
-    local router_plugins  = service_router.router.plugins
-
-    local plugin_objects = plugin.plugin_subjects()
-
     local router_plugin_keys_map = {}
 
-    if #router_plugins > 0 then
+    -- 1. route 级 + service 级插件 (需要 oak_ctx.config)
+    if oak_ctx and oak_ctx.config then
+        local config = oak_ctx.config
+        local service_router  = config.service_router
+        local service_plugins = service_router.plugins
+        local router_plugins  = service_router.router.plugins
 
-        for i = 1, #router_plugins do
+        if #router_plugins > 0 then
+            for i = 1, #router_plugins do
+                repeat
+                    if not plugin_objects[router_plugins[i].id] then
+                        break
+                    end
 
-            repeat
+                    local router_plugin_object = plugin_objects[router_plugins[i].id]
 
-                if not plugin_objects[router_plugins[i].id] then
-                    break
-                end
+                    -- auto_global 插件禁止在 route/service/consumer 级执行
+                    if router_plugin_object.handler.auto_global then
+                        break
+                    end
 
-                local router_plugin_object = plugin_objects[router_plugins[i].id]
+                    router_plugin_keys_map[router_plugin_object.key] = true
 
-                router_plugin_keys_map[router_plugin_object.key] = 0
+                    if not router_plugin_object.handler[phase] then
+                        break
+                    end
 
-                if not router_plugin_object.handler[phase] then
-                    break
-                end
-
-                -- 传递路由级嵌套 plugin config (plugins[].config)
-                router_plugin_object.handler[phase](oak_ctx, router_plugins[i].config or {})
-
-            until true
+                    router_plugin_object.handler[phase](oak_ctx, router_plugins[i].config or {})
+                until true
+            end
         end
 
-    end
+        if #service_plugins > 0 then
+            for j = 1, #service_plugins do
+                repeat
+                    if not plugin_objects[service_plugins[j].id] then
+                        break
+                    end
 
-    if #service_plugins > 0 then
+                    local service_plugin_object = plugin_objects[service_plugins[j].id]
 
-        for j = 1, #service_plugins do
+                    -- auto_global 插件禁止在 route/service/consumer 级执行
+                    if service_plugin_object.handler.auto_global then
+                        break
+                    end
 
-            repeat
+                    if router_plugin_keys_map[service_plugin_object.key] then
+                        break
+                    end
 
-                if not plugin_objects[service_plugins[j].id] then
-                    break
-                end
+                    if not service_plugin_object.handler[phase] then
+                        break
+                    end
 
-                local service_plugin_object = plugin_objects[service_plugins[j].id]
-
-                if router_plugin_keys_map[service_plugin_object.key] then
-                    break
-                end
-
-                if not service_plugin_object.handler[phase] then
-                    break
-                end
-
-                -- 传递服务级嵌套 plugin config (plugins[].config)
-                service_plugin_object.handler[phase](oak_ctx, service_plugins[j].config or {})
-
-            until true
+                    service_plugin_object.handler[phase](oak_ctx, service_plugins[j].config or {})
+                until true
+            end
         end
-
     end
 
+    -- 2. 全局插件 (config.yaml 顶层 plugins)
+    local global_executed = {}
+
+    if store.is_initialized() then
+        local global_plugins, _ = store.get_plugins()
+        if global_plugins and #global_plugins > 0 then
+            for _, gp in ipairs(global_plugins) do
+                repeat
+                    local gp_id = gp.id or gp.name
+                    if not gp_id then
+                        break
+                    end
+
+                    -- 跳过已在 route/service 级执行过的插件
+                    if router_plugin_keys_map[gp_id] then
+                        break
+                    end
+
+                    local gp_object = plugin_objects[gp_id]
+                    if not gp_object then
+                        break
+                    end
+
+                    -- auto_global 插件由第 3 阶段统一处理，此处跳过
+                    if gp_object.handler.auto_global then
+                        break
+                    end
+
+                    if not gp_object.handler[phase] then
+                        break
+                    end
+
+                    local ok, err = pcall(gp_object.handler[phase], oak_ctx, gp.config or {})
+                    if not ok then
+                        ngx.log(ngx.ERR, "[plugin] global plugin '", gp_id, "' error in ", phase, ": ", err)
+                    end
+                    global_executed[gp_id] = true
+                until true
+            end
+        end
+    end
+
+    -- 3. 自动全局插件: nyro.yaml 中加载且标记 auto_global 的插件，
+    --    即使 config.yaml 未配置也自动执行 (跳过已执行的)
+    for key, obj in pairs(plugin_objects) do
+        repeat
+            if not obj.handler.auto_global then
+                break
+            end
+
+            -- 跳过已在 route/service 或全局阶段执行过的
+            if router_plugin_keys_map[key] or global_executed[key] then
+                break
+            end
+
+            if not obj.handler[phase] then
+                break
+            end
+
+            local ok, err = pcall(obj.handler[phase], oak_ctx, {})
+            if not ok then
+                ngx.log(ngx.ERR, "[plugin] auto-global plugin '", key, "' error in ", phase, ": ", err)
+            end
+        until true
+    end
 end
 
 local function options_request_handle()
@@ -142,6 +207,16 @@ function NYRO.init_worker()
     plugin.init_worker()
     route.init_worker()
     consumer.init_worker()
+
+    -- 初始化已加载插件的 init_worker (如 local-metrics 记录 uptime)
+    local plugin_subjects = plugin.plugin_subjects()
+    if plugin_subjects then
+        for _, obj in pairs(plugin_subjects) do
+            if obj.handler and obj.handler.init_worker then
+                obj.handler.init_worker()
+            end
+        end
+    end
 end
 
 function NYRO.ssl_certificate()
@@ -248,6 +323,20 @@ function NYRO.http_admin()
 
     local admin = require("nyro.admin")
     admin.dispatch()
+end
+
+function NYRO.http_local_metrics()
+    enable_cors_handle()
+
+    local api = require("nyro.plugin.local-metrics.api")
+    api.serve()
+end
+
+function NYRO.http_local_logs()
+    enable_cors_handle()
+
+    local api = require("nyro.plugin.local-logs.api")
+    api.serve()
 end
 
 return NYRO

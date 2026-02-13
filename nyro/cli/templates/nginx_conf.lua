@@ -38,6 +38,7 @@ http {
     '$upstream_addr\t$upstream_status\t$request_id\t';
 
     access_log {{ access_log }} main;
+{{ observability_log_format }}
 
 {{ resolver }}
 
@@ -90,6 +91,7 @@ http {
 
         location / {
             add_header X-Request-Id $request_id;
+{{ observability_vars }}
 
             access_by_lua_block {
                 nyro.http_access()
@@ -129,9 +131,7 @@ http {
             proxy_pass         $upstream_scheme://nyro_backend$upstream_uri;
         }
 
-        location /nyro/prometheus/metrics {
-            content_by_lua 'prometheus:collect()';
-        }
+{{ observability_locations }}
     }
 }
 ]=]

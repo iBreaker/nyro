@@ -202,6 +202,100 @@ local function build_admin_server(config)
     }, "\n")
 end
 
+--- 检查 nyro.yaml plugins 列表中是否包含指定插件
+local function has_plugin(config, plugin_name)
+    local plugins = config.plugins
+    if not plugins or type(plugins) ~= "table" then
+        return false
+    end
+    for _, name in ipairs(plugins) do
+        if name == plugin_name then
+            return true
+        end
+    end
+    return false
+end
+
+--- 构建可观测插件相关的 nginx 指令块
+local function build_observability(config)
+    local has_logs    = has_plugin(config, "local-logs")
+    local has_metrics = has_plugin(config, "local-metrics")
+
+    -- http 块: log_format nyro_json (仅 local-logs 启用时)
+    local log_format_block = ""
+    if has_logs then
+        log_format_block = table.concat({
+            "",
+            "    log_format nyro_json escape=json '{'",
+            "    '\"timestamp\":\"$time_iso8601\",'",
+            "    '\"client_ip\":\"$remote_addr\",'",
+            "    '\"method\":\"$request_method\",'",
+            "    '\"uri\":\"$uri\",'",
+            "    '\"status\":$status,'",
+            "    '\"latency_ms\":$request_time,'",
+            "    '\"request_length\":$request_length,'",
+            "    '\"response_length\":$bytes_sent,'",
+            "    '\"upstream_addr\":\"$upstream_addr\",'",
+            "    '\"upstream_status\":\"$upstream_status\",'",
+            "    '\"request_id\":\"$request_id\",'",
+            "    '\"route\":\"$nyro_route\",'",
+            "    '\"service\":\"$nyro_service\",'",
+            "    '\"consumer\":\"$nyro_consumer\",'",
+            "    '\"model\":\"$nyro_model\",'",
+            "    '\"input_tokens\":$nyro_input_tokens,'",
+            "    '\"output_tokens\":$nyro_output_tokens'",
+            "    '}';",
+        }, "\n")
+    end
+
+    -- location / 内: set 变量 + access_log (仅 local-logs 启用时)
+    local location_vars_block = ""
+    if has_logs then
+        location_vars_block = table.concat({
+            "",
+            "            # local-logs: 自定义变量 (由 handler.lua 在 log 阶段赋值)",
+            "            set $nyro_route              '';",
+            "            set $nyro_service            '';",
+            "            set $nyro_consumer           '';",
+            "            set $nyro_model              '';",
+            "            set $nyro_input_tokens   '0';",
+            "            set $nyro_output_tokens  '0';",
+            "",
+            "            # local-logs: JSON 日志输出",
+            "            access_log logs/access.json nyro_json;",
+        }, "\n")
+    end
+
+    -- 可观测 location 块
+    local locations = {}
+    if has_metrics then
+        locations[#locations + 1] = table.concat({
+            "",
+            "        location /nyro/local/metrics {",
+            "            content_by_lua_block {",
+            "                nyro.http_local_metrics()",
+            "            }",
+            "        }",
+        }, "\n")
+    end
+    if has_logs then
+        locations[#locations + 1] = table.concat({
+            "",
+            "        location /nyro/local/logs {",
+            "            content_by_lua_block {",
+            "                nyro.http_local_logs()",
+            "            }",
+            "        }",
+        }, "\n")
+    end
+
+    return {
+        log_format_block     = log_format_block,
+        location_vars_block  = location_vars_block,
+        location_blocks      = table.concat(locations, "\n"),
+    }
+end
+
 --- 从 nyro.yaml 配置构建模板上下文
 local function build_context(config, home)
     local ctx = {}
@@ -233,6 +327,12 @@ local function build_context(config, home)
     ctx.resolver     = build_resolver(config)
     ctx.shared_dicts = build_shared_dicts(get(config, "nginx.shared_dict", {}))
     ctx.admin_server = build_admin_server(config)
+
+    -- 可观测插件 (条件化生成)
+    local obs = build_observability(config)
+    ctx.observability_log_format  = obs.log_format_block
+    ctx.observability_vars        = obs.location_vars_block
+    ctx.observability_locations   = obs.location_blocks
 
     -- Listen 指令
     local http_ports  = get(config, "nginx.http_listen",  { 10080 })

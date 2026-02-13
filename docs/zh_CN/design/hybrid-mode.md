@@ -1,8 +1,8 @@
 # NYRO Hybrid Mode 设计文档
 
-> 版本: v3.0
-> 日期: 2026-02-11
-> 状态: **设计完成，待实施**
+> 版本: v3.1
+> 日期: 2026-02-12
+> 状态: **Phase 3.1 已实施，Phase 3.2 设计完成待实施**
 
 ---
 
@@ -77,12 +77,24 @@ Phase 3.4: CP/DP + MongoDB + WebSocket 分布式
 
 ### Phase 3.2: 可观测插件
 
-| 插件 | 端点 | 数据源 |
-|------|------|--------|
-| `local-metrics` | `/nyro/local/metrics` (JSON) | `lua_shared_dict` 聚合 |
-| `local-logs` | `/nyro/local/logs` (JSON) | `access.log` 尾读 + 环形缓冲 |
+| 模块 | 说明 |
+|------|------|
+| 全局插件执行 | 增强 `run_plugin`，支持 config.yaml 顶层 `plugins` 作为全局插件执行 |
+| `local-metrics` | `http_log` 阶段写入 `plugin_local_metrics` shared_dict，三维度 (route/service/consumer) |
+| `local-logs` | `http_log` 阶段赋值 `ngx.var` 自定义变量，nginx `log_format` 输出独立 JSON 日志，API 尾读 |
 
-与已有 `/nyro/prometheus/metrics` (Prometheus text) 共存，读同一份 shared_dict。
+**v1 范围决策:**
+
+| 决策项 | v1 方案 | 后续优化 |
+|--------|---------|---------|
+| 全局插件 | `run_plugin` 在 route/service 插件之后追加全局插件执行 | — |
+| 指标维度 | route + service + consumer 三维度 | — |
+| QPS | 不计算，Console 前端按轮询间隔自行算 | Timer 采样或 Rust FFI |
+| AI Token 统计 | ai-proxy 从上游 `usage` 提取，local-metrics/local-logs 聚合输出 | — |
+| active_connections | nginx 原生 `connections_active` | — |
+| shared_dict | `plugin_local_metrics` 独立 | — |
+| 日志文件 | 独立 `logs/access.json`，保留原有 `access.log` 不变 | — |
+| 日志 Lua 字段 | 通过 `ngx.var` 自定义变量 ($nyro_route 等) 注入 log_format | — |
 
 ### Phase 3.3: Console 控制台
 
@@ -172,7 +184,7 @@ admin:
 │                                                             │
 │   local-metrics ──▶ /nyro/local/metrics (JSON)             │
 │   local-logs   ──▶ /nyro/local/logs   (JSON)              │
-│   prometheus   ──▶ /nyro/prometheus/metrics (text)         │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -399,25 +411,147 @@ store.put_route("chat", data)
 
 ## 6. 可观测插件
 
+### 6.0 前置依赖: 全局插件执行机制
+
+**现状:**
+
+`nyro.yaml` 中的 `plugins` 列表负责**加载**插件 handler 模块。
+`config.yaml` 中的顶层 `plugins` 为**全局插件实例**（与 services、routes 同级）。
+
+当前 `run_plugin()` 只执行 route 级和 service 级插件，**不执行全局插件**。
+`local-metrics` 和 `local-logs` 作为全局插件，需要对所有请求生效。
+
+**改造方案:**
+
+在 `run_plugin()` 中追加第三轮遍历——全局插件执行（在 route/service 插件之后）:
+
+```lua
+-- nyro/nyro.lua run_plugin() 伪码
+function run_plugin(phase, oak_ctx)
+    -- 1. 执行 route 级插件
+    for _, p in ipairs(router_plugins) do ... end
+
+    -- 2. 执行 service 级插件 (跳过已在 route 执行过的)
+    for _, p in ipairs(service_plugins) do ... end
+
+    -- 3. 执行全局插件 (从 store.get_plugins() 获取)
+    local global_plugins = store.get_plugins()
+    for _, gp in ipairs(global_plugins) do
+        local handler = plugin_objects[gp.id or gp.name]
+        if handler and handler.handler[phase] then
+            handler.handler[phase](oak_ctx, gp.config or {})
+        end
+    end
+end
+```
+
+全局插件**始终执行**，不受路由匹配影响。如果某请求未命中任何路由（404），
+全局插件仍会在 `http_log` 阶段执行（前提: 404 也走 log 阶段）。
+
+**config.yaml 全局插件配置示例:**
+
+```yaml
+# config.yaml
+plugins:
+  - id: local-metrics
+  - id: local-logs
+
+routes:
+  - name: chat-openai
+    service: openai
+    paths: [/v1/chat/completions]
+    plugins:           # route 级插件
+      - id: key-auth
+      - id: ai-proxy
+```
+
 ### 6.1 local-metrics 插件
 
-**作用:** 在 `log_by_lua` 阶段聚合请求指标到 `lua_shared_dict`，通过 JSON API 暴露。
+**作用:** 在 `http_log` 阶段聚合请求指标到 `lua_shared_dict plugin_local_metrics`，
+通过 JSON API 暴露给 Console。面向个人用户 / 单节点本地观测，不计算 QPS。
 
-**共享内存 Key 设计:**
+**共享内存 Key 设计 (三维度: route / service / consumer):**
 
 ```
-metrics:total_requests           → counter
-metrics:active_connections       → gauge
-metrics:route:{name}:requests    → counter
-metrics:route:{name}:latency_sum → counter (累计延迟 ms)
-metrics:route:{name}:latency_count → counter
-metrics:route:{name}:status:2xx  → counter
-metrics:route:{name}:status:4xx  → counter
-metrics:route:{name}:status:5xx  → counter
-metrics:uptime_start             → timestamp
+# ── 全局 ──
+m:total_requests                    → counter
+m:uptime_start                      → timestamp (init_worker 时写入)
+
+# ── 按 route ──
+m:rt:{name}:requests                → counter
+m:rt:{name}:latency_sum             → counter (累计延迟 ms)
+m:rt:{name}:latency_count           → counter
+m:rt:{name}:status:2xx              → counter
+m:rt:{name}:status:4xx              → counter
+m:rt:{name}:status:5xx              → counter
+
+# ── 按 service ──
+m:svc:{name}:requests               → counter
+m:svc:{name}:latency_sum            → counter
+m:svc:{name}:latency_count          → counter
+m:svc:{name}:status:2xx             → counter
+m:svc:{name}:status:4xx             → counter
+m:svc:{name}:status:5xx             → counter
+
+# ── 按 consumer ──
+m:cs:{name}:requests                → counter
+m:cs:{name}:status:2xx              → counter
+m:cs:{name}:status:4xx              → counter
+m:cs:{name}:status:5xx              → counter
+```
+
+> **说明:** `active_connections` 从 nginx 内置变量 `ngx.var.connections_active` 读取，不写入 shared_dict。
+
+**handler.lua http_log 阶段逻辑:**
+
+```lua
+function _M.http_log(oak_ctx, plugin_config)
+    local dict = ngx.shared.plugin_local_metrics
+    local status = ngx.status
+    local request_time = tonumber(ngx.var.request_time) or 0
+    local latency_ms = request_time * 1000
+
+    -- 状态码分桶
+    local status_bucket
+    if status >= 200 and status < 300 then
+        status_bucket = "2xx"
+    elseif status >= 400 and status < 500 then
+        status_bucket = "4xx"
+    else
+        status_bucket = "5xx"
+    end
+
+    -- 全局
+    dict:incr("m:total_requests", 1, 0)
+
+    -- route 维度
+    local route_name = oak_ctx.config and oak_ctx.config.route and oak_ctx.config.route.name
+    if route_name then
+        dict:incr("m:rt:" .. route_name .. ":requests", 1, 0)
+        dict:incr("m:rt:" .. route_name .. ":latency_sum", latency_ms, 0)
+        dict:incr("m:rt:" .. route_name .. ":latency_count", 1, 0)
+        dict:incr("m:rt:" .. route_name .. ":status:" .. status_bucket, 1, 0)
+    end
+
+    -- service 维度
+    local service_name = oak_ctx.config and oak_ctx.config.service and oak_ctx.config.service.name
+    if service_name then
+        dict:incr("m:svc:" .. service_name .. ":requests", 1, 0)
+        dict:incr("m:svc:" .. service_name .. ":latency_sum", latency_ms, 0)
+        dict:incr("m:svc:" .. service_name .. ":latency_count", 1, 0)
+        dict:incr("m:svc:" .. service_name .. ":status:" .. status_bucket, 1, 0)
+    end
+
+    -- consumer 维度
+    local consumer_name = oak_ctx._consumer and oak_ctx._consumer.name or "anonymous"
+    dict:incr("m:cs:" .. consumer_name .. ":requests", 1, 0)
+    dict:incr("m:cs:" .. consumer_name .. ":status:" .. status_bucket, 1, 0)
+end
 ```
 
 **API 端点:** `GET /nyro/local/metrics`
+
+放置在主 server block 中，始终可用，无需 Admin 开启。
 
 **响应示例:**
 
@@ -430,43 +564,109 @@ metrics:uptime_start             → timestamp
     {
       "name": "chat-openai",
       "requests": 50000,
-      "qps": 12.5,
       "latency_avg_ms": 85,
-      "status": {
-        "2xx": 49500,
-        "4xx": 400,
-        "5xx": 100
-      }
+      "status": { "2xx": 49500, "4xx": 400, "5xx": 100 }
+    }
+  ],
+  "services": [
+    {
+      "name": "openai",
+      "requests": 80000,
+      "latency_avg_ms": 90,
+      "status": { "2xx": 79000, "4xx": 700, "5xx": 300 }
+    }
+  ],
+  "consumers": [
+    {
+      "name": "ai-app",
+      "requests": 60000,
+      "status": { "2xx": 59500, "4xx": 300, "5xx": 200 }
+    },
+    {
+      "name": "anonymous",
+      "requests": 65000,
+      "status": { "2xx": 64000, "4xx": 800, "5xx": 200 }
     }
   ]
 }
 ```
 
+> Console 前端可按轮询间隔对 `total_requests` 做差值计算实时 QPS。
+
 **实现文件:**
 
 ```
 nyro/plugin/local-metrics/
-├── handler.lua   -- http_log 阶段写入 shared_dict
-└── schema.lua    -- 配置 (shared_dict name, 保留时长等)
+├── handler.lua   -- http_log 阶段写入 shared_dict + init_worker 写入 uptime_start
+├── schema.lua    -- 配置 schema (预留扩展)
+└── api.lua       -- /nyro/local/metrics 读取 shared_dict 构造 JSON 响应
 ```
 
-**与 Prometheus 的关系:**
-
-两者读同一份 `lua_shared_dict` 数据:
-- `/nyro/prometheus/metrics` → Prometheus text 格式 (给 Prometheus/Grafana)
-- `/nyro/local/metrics` → JSON 格式 (给 Console)
+local-metrics 使用独立的 shared_dict `plugin_local_metrics` (JSON 格式，给 Console)。
 
 ### 6.2 local-logs 插件
 
-**作用:** 维护最近 N 条请求日志的环形缓冲，通过 JSON API 暴露。
+**作用:** 在 `http_log` 阶段将 Lua 层面的上下文信息（route/service/consumer）
+写入 `ngx.var` 自定义变量，由 nginx `log_format nyro_json` 输出到独立的 JSON 日志文件
+`logs/access.json`。API 端点尾读该文件返回最近 N 条日志。
 
-**存储方案:** `lua_shared_dict` 环形缓冲
+**原有 `logs/access.log`（text 格式）保持不变。**
+
+**设计思路:**
 
 ```
-logs:head   → 最新写入位置 (number)
-logs:tail   → 最旧有效位置 (number)
-logs:size   → 缓冲区容量 (默认 1000)
-logs:{idx}  → JSON string (单条日志)
+请求流经 location / 的各阶段:
+  access_by_lua  → route match, plugin 执行
+  ...
+  log_by_lua     → local-logs handler 将 oak_ctx 信息写入 ngx.var
+                 → nginx 用 log_format nyro_json 输出到 logs/access.json
+                 → 原有 log_format main 继续输出到 logs/access.log
+```
+
+**handler.lua http_log 阶段逻辑:**
+
+```lua
+function _M.http_log(oak_ctx, plugin_config)
+    -- 将 Lua 层面的上下文信息写入 ngx.var，供 log_format 引用
+    local route_name = oak_ctx.config and oak_ctx.config.route and oak_ctx.config.route.name
+    local service_name = oak_ctx.config and oak_ctx.config.service and oak_ctx.config.service.name
+    local consumer_name = oak_ctx._consumer and oak_ctx._consumer.name
+
+    ngx.var.nyro_route    = route_name or ""
+    ngx.var.nyro_service  = service_name or ""
+    ngx.var.nyro_consumer = consumer_name or ""
+end
+```
+
+**nginx 模板新增:**
+
+```nginx
+# ── 自定义变量 (在 location / 中声明) ──
+set $nyro_route    '';
+set $nyro_service  '';
+set $nyro_consumer '';
+
+# ── JSON 日志格式 (在 http 块中声明) ──
+log_format nyro_json escape=json '{'
+    '"timestamp":"$time_iso8601",'
+    '"client_ip":"$remote_addr",'
+    '"method":"$request_method",'
+    '"uri":"$uri",'
+    '"status":$status,'
+    '"latency_ms":$request_time,'
+    '"request_length":$request_length,'
+    '"response_length":$bytes_sent,'
+    '"upstream_addr":"$upstream_addr",'
+    '"upstream_status":"$upstream_status",'
+    '"request_id":"$request_id",'
+    '"route":"$nyro_route",'
+    '"service":"$nyro_service",'
+    '"consumer":"$nyro_consumer"'
+'}';
+
+# ── 双日志输出 (在 location / 中) ──
+access_log logs/access.log main;                      # 原有不变
+access_log logs/access.json nyro_json;       # local-logs 专用
 ```
 
 **日志条目格式:**
@@ -478,24 +678,39 @@ logs:{idx}  → JSON string (单条日志)
   "method": "POST",
   "uri": "/v1/chat/completions",
   "status": 200,
-  "latency_ms": 85,
+  "latency_ms": 0.085,
   "request_length": 256,
   "response_length": 1024,
+  "upstream_addr": "api.deepseek.com:443",
+  "upstream_status": "200",
+  "request_id": "abc123",
   "route": "chat-openai",
   "service": "openai",
-  "consumer": "app-1"
+  "consumer": "ai-app"
 }
 ```
 
-**API 端点:** `GET /nyro/local/logs?limit=50&offset=0`
+**API 端点:** `GET /nyro/local/logs?limit=50`
+
+放置在主 server block 中，始终可用。
+
+**尾读实现 (api.lua):**
+
+```lua
+-- 从文件末尾反向读取最近 N 行
+-- 1. io.open(log_path, "r")
+-- 2. file:seek("end", -read_size)  -- 从末尾回退 read_size 字节
+-- 3. 读取内容，按 \n 分割
+-- 4. 取最后 limit 行，每行 json.decode 后返回
+```
 
 **响应:**
 
 ```json
 {
-  "total": 1000,
+  "total": 50,
   "items": [
-    { "timestamp": "...", "method": "POST", ... },
+    { "timestamp": "...", "method": "POST", "uri": "...", ... },
     ...
   ]
 }
@@ -505,17 +720,18 @@ logs:{idx}  → JSON string (单条日志)
 
 ```
 nyro/plugin/local-logs/
-├── handler.lua   -- http_log 阶段写入环形缓冲
-└── schema.lua    -- 配置 (buffer_size 默认 1000)
+├── handler.lua   -- http_log 阶段赋值 ngx.var.nyro_*
+├── schema.lua    -- 配置 schema (log_path, 预留扩展)
+└── api.lua       -- /nyro/local/logs 尾读 JSON 日志文件
 ```
 
-### 端点注册
+### 6.3 端点注册
 
-两个插件的 API 端点 (`/nyro/local/metrics`、`/nyro/local/logs`) 需要在 nginx 模板中注册，
-与 Admin API、Prometheus 端点同级:
+两个插件的 API 端点放置在**主 server block** 中，
+始终可用，不依赖 `admin.enabled` 配置:
 
 ```nginx
-# nginx_conf.lua 模板中新增
+# nginx_conf.lua 模板 — 主 server block 内
 location /nyro/local/metrics {
     content_by_lua_block {
         nyro.http_local_metrics()
@@ -527,6 +743,20 @@ location /nyro/local/logs {
         nyro.http_local_logs()
     }
 }
+```
+
+`nyro.lua` 新增对应入口函数:
+
+```lua
+function NYRO.http_local_metrics()
+    local api = require("nyro.plugin.local-metrics.api")
+    api.serve()
+end
+
+function NYRO.http_local_logs()
+    local api = require("nyro.plugin.local-logs.api")
+    api.serve()
+end
 ```
 
 ---
@@ -676,7 +906,6 @@ CP 汇总所有 DP 状态，通过 `/nyro/admin/status` 返回集群视图。
 | 配置管理 (CRUD) | `Admin API /nyro/admin/*` |
 | 实时指标 | `/nyro/local/metrics` (JSON, 轮询) |
 | 请求日志 | `/nyro/local/logs` (JSON, 轮询) |
-| Prometheus 集成 | `/nyro/prometheus/metrics` (用户自行接 Grafana) |
 | 节点状态 | `/nyro/admin/status` |
 | 集群视图 (CP) | `/nyro/admin/status` (含所有 DP 信息) |
 
@@ -752,7 +981,7 @@ store:
   #     config_dump: conf/config_dump.yaml  # 可选: 本地容灾备份
 
 # ============================================================
-# 插件列表 (新增可观测插件)
+# 插件模块加载列表 (nyro.yaml — 声明要加载哪些插件 handler)
 # ============================================================
 plugins:
   - cors
@@ -763,14 +992,49 @@ plugins:
   - limit-conn
   - limit-count
   - ai-proxy
-  - local-metrics                # 本地指标聚合
-  - local-logs                   # 本地日志缓冲
+  - local-metrics                # 本地指标聚合 (全局插件)
+  - local-logs                   # 本地日志上下文注入 (全局插件)
 ```
 
 ### nginx 模板新增
 
+**1. http 块 — JSON 日志格式 (local-logs 专用):**
+
 ```nginx
-# 可观测插件端点 (与 admin server 独立，始终可用)
+log_format nyro_json escape=json '{'
+    '"timestamp":"$time_iso8601",'
+    '"client_ip":"$remote_addr",'
+    '"method":"$request_method",'
+    '"uri":"$uri",'
+    '"status":$status,'
+    '"latency_ms":$request_time,'
+    '"request_length":$request_length,'
+    '"response_length":$bytes_sent,'
+    '"upstream_addr":"$upstream_addr",'
+    '"upstream_status":"$upstream_status",'
+    '"request_id":"$request_id",'
+    '"route":"$nyro_route",'
+    '"service":"$nyro_service",'
+    '"consumer":"$nyro_consumer"'
+'}';
+```
+
+**2. location / 块 — 自定义变量 + 双日志:**
+
+```nginx
+# 自定义变量声明 (供 local-logs handler 赋值)
+set $nyro_route    '';
+set $nyro_service  '';
+set $nyro_consumer '';
+
+# 双日志输出
+access_log logs/access.log main;                 # 原有 text 格式不变
+access_log logs/access.json nyro_json;  # local-logs JSON 格式
+```
+
+**3. 主 server block — 可观测端点:**
+
+```nginx
 location /nyro/local/metrics {
     content_by_lua_block {
         nyro.http_local_metrics()
@@ -784,14 +1048,14 @@ location /nyro/local/logs {
 }
 ```
 
-### lua_shared_dict 新增
+### lua_shared_dict 变更
 
 ```yaml
 nginx:
   shared_dict:
     # ... 已有 ...
-    local_metrics: 10m           # local-metrics 插件
-    local_logs: 20m              # local-logs 插件 (环形缓冲)
+    plugin_local_metrics: 10m          # local-metrics 插件
+    # local_logs 不需要 shared_dict (使用文件存储)
 ```
 
 ---
@@ -850,15 +1114,17 @@ adapter.delete_certificate(name)
 
 **Phase 3.2: 可观测插件**
 
-| 文件 | 操作 |
-|------|------|
-| `nyro/plugin/local-metrics/handler.lua` | 新增 |
-| `nyro/plugin/local-metrics/schema.lua` | 新增 |
-| `nyro/plugin/local-logs/handler.lua` | 新增 |
-| `nyro/plugin/local-logs/schema.lua` | 新增 |
-| `nyro/nyro.lua` | 修改 — 新增 http_local_metrics / http_local_logs |
-| `nyro/cli/templates/nginx_conf.lua` | 修改 — 新增 location 块 |
-| `conf/nyro.yaml` | 修改 — 插件列表、shared_dict |
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `nyro/nyro.lua` | 修改 | `run_plugin` 增加全局插件执行；新增 `http_local_metrics` / `http_local_logs` |
+| `nyro/plugin/local-metrics/handler.lua` | 新增 | `http_log` 阶段写入 shared_dict (三维度) |
+| `nyro/plugin/local-metrics/schema.lua` | 新增 | 配置 schema |
+| `nyro/plugin/local-metrics/api.lua` | 新增 | `/nyro/local/metrics` API handler |
+| `nyro/plugin/local-logs/handler.lua` | 新增 | `http_log` 阶段赋值 `ngx.var.nyro_*` |
+| `nyro/plugin/local-logs/schema.lua` | 新增 | 配置 schema |
+| `nyro/plugin/local-logs/api.lua` | 新增 | `/nyro/local/logs` 尾读 JSON 日志 |
+| `nyro/cli/templates/nginx_conf.lua` | 修改 | `log_format nyro_json`、`set $nyro_*`、双 `access_log`、两个 location |
+| `conf/nyro.yaml` | 修改 | `shared_dict` 新增 `plugin_local_metrics`；`plugins` 列表新增 |
 
 **Phase 3.4: CP/DP**
 
@@ -886,6 +1152,8 @@ adapter.delete_certificate(name)
 | 8 | **批量操作** | 单条 CRUD | `POST /batch` 批量创建/更新/删除 | 低 |
 | 9 | **Audit Log** | 无 | 记录 Admin API 操作历史 (谁/何时/改了什么) | 中 |
 | 10 | **Import/Export** | 无 | `GET /config/export` 导出完整配置 / `POST /config/import` 导入 | 中 |
+| 11 | **AI Token 统计** | ✅ 已实现 | ai-proxy body_filter 按 target_proto 提取上游 usage，local-metrics 聚合，local-logs 记录 | — |
+| 12 | **QPS 计算** | 不实现，Console 前端差值计算 | Timer 采样或 Rust FFI 实时计算 | 低 |
 
 ### 参考
 

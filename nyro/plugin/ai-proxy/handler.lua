@@ -230,6 +230,53 @@ local function is_stream_request(body_str)
     return tbl and tbl.stream == true
 end
 
+-- ── Usage 提取: 按上游协议 (target_proto) 匹配 token 字段 ──────────────────
+
+local USAGE_EXTRACTORS = {
+    openai_chat = function(str)
+        local pt = string_match(str, '"prompt_tokens"%s*:%s*(%d+)')
+        local ct = string_match(str, '"completion_tokens"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+    openai_responses = function(str)
+        local pt = string_match(str, '"input_tokens"%s*:%s*(%d+)')
+        local ct = string_match(str, '"output_tokens"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+    anthropic_messages = function(str)
+        local pt = string_match(str, '"input_tokens"%s*:%s*(%d+)')
+        local ct = string_match(str, '"output_tokens"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+    claude_code = function(str)
+        local pt = string_match(str, '"input_tokens"%s*:%s*(%d+)')
+        local ct = string_match(str, '"output_tokens"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+    gemini_chat = function(str)
+        local pt = string_match(str, '"promptTokenCount"%s*:%s*(%d+)')
+        local ct = string_match(str, '"candidatesTokenCount"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+    ollama_chat = function(str)
+        local pt = string_match(str, '"prompt_eval_count"%s*:%s*(%d+)')
+        local ct = string_match(str, '"eval_count"%s*:%s*(%d+)')
+        if pt or ct then return tonumber(pt) or 0, tonumber(ct) or 0 end
+    end,
+}
+
+--- 从响应体中尝试提取 usage (写入 ctx.input_tokens / ctx.output_tokens)
+local function try_extract_usage(ctx, proto, str)
+    local extractor = USAGE_EXTRACTORS[proto]
+    if not extractor then return end
+
+    local pt, ct = extractor(str)
+    if pt then
+        ctx.input_tokens  = pt
+        ctx.output_tokens = ct
+    end
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════
 -- http_access: 改写请求体 + 请求头 + 上游路径, 不短路
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -312,6 +359,15 @@ function _M.http_access(oak_ctx, plugin_config)
         if cfg.model then
             final_tbl.model = cfg.model
         end
+
+        -- OpenAI streaming: 注入 stream_options.include_usage 强制上游返回 token 统计
+        if streaming and target_proto == "openai_chat" then
+            if not final_tbl.stream_options then
+                final_tbl.stream_options = {}
+            end
+            final_tbl.stream_options.include_usage = true
+        end
+
         converted_body = json.encode(final_tbl) or converted_body
     end
 
@@ -337,10 +393,8 @@ function _M.http_access(oak_ctx, plugin_config)
         ngx.var.upstream_uri = upstream_path
     end
 
-    -- 需要转换响应体时, 禁止上游返回压缩数据 (否则 body_filter 无法 JSON 解析)
-    if source_proto ~= target_proto then
-        ngx.req.set_header("Accept-Encoding", "identity")
-    end
+    -- 禁止上游返回压缩数据 (body_filter 需要读取原始 JSON 提取 usage)
+    ngx.req.set_header("Accept-Encoding", "identity")
 
     -- 在 oak_ctx 上存储状态, 供后续 filter 阶段使用
     oak_ctx._ai_proxy = {
@@ -349,6 +403,7 @@ function _M.http_access(oak_ctx, plugin_config)
         target_proto   = target_proto,
         streaming      = streaming,
         need_convert   = (source_proto ~= target_proto),
+        model          = final_tbl and final_tbl.model or nil,
     }
 
     -- 请求正常流转到 balancer -> proxy_pass, 不短路
@@ -371,10 +426,8 @@ function _M.http_header_filter(oak_ctx, _plugin_config)
         ngx.header["X-Accel-Buffering"] = "no"
     end
 
-    -- body 会被改写, 原始 Content-Length 不再准确
-    if ctx.need_convert then
-        ngx.header["Content-Length"] = nil
-    end
+    -- body_filter 会缓冲响应体 (用于提取 usage), Content-Length 不再准确
+    ngx.header["Content-Length"] = nil
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -383,35 +436,43 @@ end
 
 function _M.http_body_filter(oak_ctx, _plugin_config)
     local ctx = oak_ctx._ai_proxy
-    if not ctx or not ctx.enabled or not ctx.need_convert then
+    if not ctx or not ctx.enabled then
         return
     end
-
-    local chunk = ngx.arg[1]
-    local eof   = ngx.arg[2]
 
     -- 跳过非 200 响应
     if ngx.status ~= 200 then
         return
     end
 
+    local chunk = ngx.arg[1]
+    local eof   = ngx.arg[2]
+
     local source_proto = ctx.source_proto
     local target_proto = ctx.target_proto
+    local need_convert = ctx.need_convert
 
     if not ctx.streaming then
-        -- ── 非流式: 缓冲所有 chunk, eof 时一次性转换 ────────────────────
+        -- ── 非流式: 缓冲所有 chunk, eof 时提取 usage + 转换 ─────────────
         local buf = ctx._buf or ""
         buf = buf .. (chunk or "")
 
         if eof then
             if #buf > 0 then
-                local converted, conv_err = llm_ffi.convert_response(
-                    target_proto, source_proto, buf
-                )
-                if converted then
-                    ngx.arg[1] = converted
+                -- 从原始上游响应提取 usage (转换前)
+                try_extract_usage(ctx, target_proto, buf)
+
+                if need_convert then
+                    local converted, conv_err = llm_ffi.convert_response(
+                        target_proto, source_proto, buf
+                    )
+                    if converted then
+                        ngx.arg[1] = converted
+                    else
+                        ngx.log(ngx.WARN, "[ai-proxy] response conversion failed: ", conv_err)
+                        ngx.arg[1] = buf
+                    end
                 else
-                    ngx.log(ngx.WARN, "[ai-proxy] response conversion failed: ", conv_err)
                     ngx.arg[1] = buf
                 end
             end
@@ -421,7 +482,7 @@ function _M.http_body_filter(oak_ctx, _plugin_config)
             ctx._buf = buf
         end
     else
-        -- ── 流式 SSE: 逐行扫描, 转换 data: 行 ──────────────────────────
+        -- ── 流式 SSE: 逐行扫描, 提取 usage + 转换 ──────────────────────
         local buf = (ctx._buf or "") .. (chunk or "")
         local output = {}
 
@@ -437,13 +498,20 @@ function _M.http_body_filter(oak_ctx, _plugin_config)
             -- 检查是否是 data: 行
             local payload = string_match(line, "^data:%s*(.-)%s*$")
             if payload and payload ~= "" and payload ~= "[DONE]" then
-                local converted, conv_err = llm_ffi.convert_response(
-                    target_proto, source_proto, payload
-                )
-                if converted then
-                    table_insert(output, "data: " .. converted .. "\n")
+                -- 从原始上游 SSE chunk 提取 usage
+                try_extract_usage(ctx, target_proto, payload)
+
+                if need_convert then
+                    local converted, conv_err = llm_ffi.convert_response(
+                        target_proto, source_proto, payload
+                    )
+                    if converted then
+                        table_insert(output, "data: " .. converted .. "\n")
+                    else
+                        ngx.log(ngx.WARN, "[ai-proxy] SSE chunk conversion failed: ", conv_err)
+                        table_insert(output, line)
+                    end
                 else
-                    ngx.log(ngx.WARN, "[ai-proxy] SSE chunk conversion failed: ", conv_err)
                     table_insert(output, line)
                 end
             else

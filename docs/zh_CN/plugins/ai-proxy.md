@@ -193,10 +193,38 @@ routes:
 当请求体中 `stream: true` 时:
 
 - **请求**: Gemini 上游路径自动切换为 `streamGenerateContent?alt=sse`
+- **请求**: OpenAI 上游自动注入 `stream_options.include_usage: true`，强制返回 token 统计
 - **响应头**: 设置 `Content-Type: text/event-stream`、`X-Accel-Buffering: no`
 - **响应体**: 逐行扫描 SSE `data:` 行，对每个 JSON payload 单独转换
 
 非流式时缓冲完整响应体后一次性转换。
+
+---
+
+## Token 统计
+
+ai-proxy 在 `http_body_filter` 阶段自动从上游响应中提取 token 用量，按上游协议 (`target_proto`) 匹配对应字段：
+
+| 上游协议 | prompt 字段 | completion 字段 |
+|---|---|---|
+| openai_chat | `usage.prompt_tokens` | `usage.completion_tokens` |
+| openai_responses | `usage.input_tokens` | `usage.output_tokens` |
+| anthropic_messages | `usage.input_tokens` | `usage.output_tokens` |
+| gemini_chat | `usageMetadata.promptTokenCount` | `usageMetadata.candidatesTokenCount` |
+| ollama_chat | `prompt_eval_count` | `eval_count` |
+
+提取后存入 `oak_ctx._ai_proxy`，供下游插件使用：
+
+| 字段 | 说明 |
+|------|------|
+| `model` | 请求使用的模型名称（来自请求体或插件配置 `config.model`） |
+| `input_tokens` | 输入 Token 数（上游 `usage` 权威值） |
+| `output_tokens` | 输出 Token 数（上游 `usage` 权威值） |
+
+- **local-metrics**: 按 route / service / consumer / model 维度聚合 token 计数和请求量
+- **local-logs**: 写入 `$nyro_model` / `$nyro_input_tokens` / `$nyro_output_tokens`，输出到 `logs/access.json`
+
+Token 数据来源为上游厂商返回的权威值，不做本地估算。非 AI 请求 token 字段为 0、model 为空。
 
 ---
 

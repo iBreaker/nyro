@@ -42,9 +42,9 @@ nginx:
     plugin_limit_conn: 50m
     plugin_limit_req: 50m
     plugin_limit_count: 50m
+    plugin_local_metrics: 10m
     upstream_health_check: 10m
     upstream_worker_event: 10m
-    prometheus_metrics: 10m
     worker_events: 10m
 
 # ============================================================
@@ -58,7 +58,7 @@ store:
     config_file: conf/config.yaml
 
 # ============================================================
-# 插件列表
+# 插件模块加载列表 (声明要加载哪些插件 handler)
 # ============================================================
 plugins:
   - cors
@@ -69,6 +69,8 @@ plugins:
   - limit-conn
   - limit-count
   - ai-proxy
+  - local-metrics
+  - local-logs
 
 # ============================================================
 # 日志配置
