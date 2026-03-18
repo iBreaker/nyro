@@ -4,6 +4,29 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.3.0
+
+> Released on 2026-03-18
+
+#### Features
+
+- **OpenAI Responses pipeline support**: add request/response transformation path for `/v1/responses` to improve tool-chain compatibility with modern OpenAI-style clients
+- **Provider model test workflow**: introduce staged provider testing with unified action feedback in provider management flows
+- **Ollama capability detection**: add vendor-aware capability checks to auto-handle tool-support differences by model
+- **Gemini cURL preview improvement**: preserve `:` in model IDs (for example `gemma3:1b`) when rendering Connect page Gemini endpoint snippets
+
+#### Improvements
+
+- **Provider UX consistency**: improve vendor/channel synchronization and keep route-edit state reset behavior predictable
+- **Route model discovery behavior**: only enable discovery dropdown when provider model endpoint is actually available
+- **Admin error handling UX**: localize backend error messages consistently and unify failure dialog presentation across admin pages
+
+#### Fixes
+
+- Fix MiniMax + Codex interoperability issue where upstream rejects `system` role by normalizing responses instructions for MiniMax on Responses API ingress
+- Fix OpenRouter model discovery behavior and restore provider auto-test flow after provider create
+- Fix Windows desktop dropdown/search selection regression caused by drag-capture conflict in Tauri title-drag handling
+
 ## v1.2.0
 
 > Released on 2026-03-15
