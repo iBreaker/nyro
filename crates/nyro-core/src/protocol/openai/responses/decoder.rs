@@ -103,12 +103,71 @@ impl IngressDecoder for ResponsesDecoder {
 }
 
 fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
-    if item
+    let item_type = item
         .get("type")
         .and_then(|v| v.as_str())
-        .is_some_and(|t| t != "message")
-    {
-        anyhow::bail!("unsupported input item type: only 'message' is supported");
+        .unwrap_or("message");
+
+    if item_type == "function_call_output" {
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("tool_call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if call_id.trim().is_empty() {
+            anyhow::bail!("function_call_output missing call_id");
+        }
+        let output = item.get("output").cloned().unwrap_or(Value::Null);
+        let output_text = match output {
+            Value::String(s) => s,
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+
+        return Ok(Some(InternalMessage {
+            role: Role::Tool,
+            content: MessageContent::Text(output_text),
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+        }));
+    }
+
+    if item_type == "function_call" {
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arguments = item
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}")
+            .to_string();
+        if call_id.trim().is_empty() || name.trim().is_empty() {
+            anyhow::bail!("function_call item missing call_id or name");
+        }
+        return Ok(Some(InternalMessage {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: call_id,
+                name,
+                arguments,
+            }]),
+            tool_call_id: None,
+        }));
+    }
+
+    if item_type != "message" {
+        // Ignore other responses item types (reasoning, file_search_call, etc).
+        return Ok(None);
     }
 
     let role_str = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -143,12 +202,12 @@ fn decode_input_item(item: &Value) -> Result<Option<InternalMessage>> {
             }
             let text = texts.join("");
             if text.is_empty() {
-                anyhow::bail!("empty content in responses input item");
+                return Ok(None);
             }
             MessageContent::Text(text)
         }
         Some(_) => anyhow::bail!("unsupported content type in responses input item"),
-        None => anyhow::bail!("missing content in responses input item"),
+        None => return Ok(None),
     };
 
     Ok(Some(InternalMessage {

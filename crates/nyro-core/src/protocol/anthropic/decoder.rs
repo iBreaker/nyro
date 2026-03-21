@@ -35,7 +35,7 @@ impl IngressDecoder for AnthropicDecoder {
         }
 
         for msg in req.messages {
-            messages.push(decode_message(msg)?);
+            messages.extend(decode_message(msg)?);
         }
 
         let tools = req.tools.map(|tools| {
@@ -64,12 +64,18 @@ impl IngressDecoder for AnthropicDecoder {
     }
 }
 
-fn decode_message(msg: AnthropicMessage) -> Result<InternalMessage> {
+fn decode_message(msg: AnthropicMessage) -> Result<Vec<InternalMessage>> {
     let role = match msg.role.as_str() {
         "user" => Role::User,
         "assistant" => Role::Assistant,
         other => anyhow::bail!("unknown Anthropic role: {other}"),
     };
+
+    if role == Role::User {
+        if let AnthropicContent::Blocks(blocks) = msg.content {
+            return decode_user_blocks(blocks);
+        }
+    }
 
     let (content, tool_calls, tool_call_id) = match msg.content {
         AnthropicContent::Text(t) => (MessageContent::Text(t), None, None),
@@ -82,6 +88,11 @@ fn decode_message(msg: AnthropicMessage) -> Result<InternalMessage> {
                 match block {
                     AnthropicContentBlock::Text { text } => {
                         content_blocks.push(ContentBlock::Text { text });
+                    }
+                    AnthropicContentBlock::Thinking { thinking, .. } => {
+                        if !thinking.trim().is_empty() {
+                            content_blocks.push(ContentBlock::Text { text: thinking });
+                        }
                     }
                     AnthropicContentBlock::Image { source } => {
                         content_blocks.push(ContentBlock::Image {
@@ -116,12 +127,12 @@ fn decode_message(msg: AnthropicMessage) -> Result<InternalMessage> {
 
             if content_blocks.len() == 1 {
                 if let ContentBlock::Text { text } = &content_blocks[0] {
-                    return Ok(InternalMessage {
+                    return Ok(vec![InternalMessage {
                         role,
                         content: MessageContent::Text(text.clone()),
                         tool_calls: tool_calls_opt,
                         tool_call_id: tc_id,
-                    });
+                    }]);
                 }
             }
 
@@ -133,10 +144,74 @@ fn decode_message(msg: AnthropicMessage) -> Result<InternalMessage> {
         }
     };
 
-    Ok(InternalMessage {
+    Ok(vec![InternalMessage {
         role,
         content,
         tool_calls,
         tool_call_id,
-    })
+    }])
+}
+
+fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<InternalMessage>> {
+    let mut messages: Vec<InternalMessage> = Vec::new();
+    let mut user_blocks: Vec<ContentBlock> = Vec::new();
+
+    for block in blocks {
+        match block {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                let tool_text = match content.unwrap_or(Value::Null) {
+                    Value::String(s) => s,
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                messages.push(InternalMessage {
+                    role: Role::Tool,
+                    content: MessageContent::Text(tool_text),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id),
+                });
+            }
+            AnthropicContentBlock::Text { text } => user_blocks.push(ContentBlock::Text { text }),
+            AnthropicContentBlock::Thinking { thinking, .. } => {
+                if !thinking.trim().is_empty() {
+                    user_blocks.push(ContentBlock::Text { text: thinking });
+                }
+            }
+            AnthropicContentBlock::Image { source } => user_blocks.push(ContentBlock::Image {
+                source: ImageSource {
+                    media_type: source.media_type,
+                    data: source.data,
+                },
+            }),
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                user_blocks.push(ContentBlock::ToolUse { id, name, input })
+            }
+        }
+    }
+
+    if !user_blocks.is_empty() {
+        let content = if user_blocks.len() == 1 {
+            if let ContentBlock::Text { text } = &user_blocks[0] {
+                MessageContent::Text(text.clone())
+            } else {
+                MessageContent::Blocks(user_blocks)
+            }
+        } else {
+            MessageContent::Blocks(user_blocks)
+        };
+        messages.insert(
+            0,
+            InternalMessage {
+                role: Role::User,
+                content,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
+    }
+
+    Ok(messages)
 }

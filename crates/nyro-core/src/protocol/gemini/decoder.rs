@@ -80,7 +80,7 @@ impl IngressDecoder for GeminiDecoder {
 }
 
 fn decode_content(content: &GeminiContent) -> Result<InternalMessage> {
-    let role = match content.role.as_deref() {
+    let mut role = match content.role.as_deref() {
         Some("user") | None => Role::User,
         Some("model") => Role::Assistant,
         Some(other) => anyhow::bail!("unknown Gemini role: {other}"),
@@ -89,7 +89,7 @@ fn decode_content(content: &GeminiContent) -> Result<InternalMessage> {
     let mut text_parts = Vec::new();
     let mut blocks = Vec::new();
     let mut tool_calls = Vec::new();
-    let mut tool_call_id = None;
+    let mut has_function_response = false;
 
     for part in &content.parts {
         match part {
@@ -119,7 +119,7 @@ fn decode_content(content: &GeminiContent) -> Result<InternalMessage> {
                 });
             }
             GeminiPart::FunctionResponse { function_response } => {
-                tool_call_id = Some(function_response.name.clone());
+                has_function_response = true;
                 blocks.push(ContentBlock::ToolResult {
                     tool_use_id: function_response.name.clone(),
                     content: function_response.response.clone(),
@@ -139,11 +139,14 @@ fn decode_content(content: &GeminiContent) -> Result<InternalMessage> {
     } else {
         Some(tool_calls)
     };
+    if has_function_response {
+        role = Role::Tool;
+    }
 
     Ok(InternalMessage {
         role,
         content,
         tool_calls: tool_calls_opt,
-        tool_call_id,
+        tool_call_id: None,
     })
 }
