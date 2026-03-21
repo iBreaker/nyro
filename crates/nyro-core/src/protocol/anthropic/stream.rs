@@ -66,7 +66,9 @@ impl ResponseParser for AnthropicResponseParser {
             id,
             model,
             content: content_text,
+            reasoning_content: None,
             tool_calls,
+            response_items: None,
             stop_reason,
             usage,
         })
@@ -80,6 +82,13 @@ pub struct AnthropicResponseFormatter;
 impl ResponseFormatter for AnthropicResponseFormatter {
     fn format_response(&self, resp: &InternalResponse) -> Value {
         let mut content = Vec::new();
+
+        if let Some(reasoning) = resp.reasoning_content.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            content.push(serde_json::json!({
+                "type": "thinking",
+                "thinking": reasoning,
+            }));
+        }
 
         if !resp.content.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": resp.content}));
@@ -283,7 +292,9 @@ pub struct AnthropicStreamFormatter {
     id: String,
     model: String,
     block_index: usize,
+    in_thinking_block: bool,
     in_text_block: bool,
+    in_tool_block: bool,
     message_started: bool,
 }
 
@@ -294,7 +305,9 @@ impl AnthropicStreamFormatter {
             id: format!("msg_{}", Uuid::new_v4().simple()),
             model: String::new(),
             block_index: 0,
+            in_thinking_block: false,
             in_text_block: false,
+            in_tool_block: false,
             message_started: false,
         }
     }
@@ -332,8 +345,38 @@ impl StreamFormatter for AnthropicStreamFormatter {
                     self.model = model.clone();
                     self.ensure_message_start(&mut events);
                 }
-                StreamDelta::TextDelta(text) => {
+                StreamDelta::ReasoningDelta(text) => {
                     self.ensure_message_start(&mut events);
+                    self.close_text_block_if_open(&mut events);
+                    if !self.in_thinking_block {
+                        self.in_thinking_block = true;
+                        let block_start = serde_json::json!({
+                            "type": "content_block_start",
+                            "index": self.block_index,
+                            "content_block": {"type": "thinking", "thinking": ""}
+                        });
+                        events.push(SseEvent::new(
+                            Some("content_block_start"),
+                            block_start.to_string(),
+                        ));
+                    }
+                    let delta_ev = serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": self.block_index,
+                        "delta": {"type": "thinking_delta", "thinking": text}
+                    });
+                    events.push(SseEvent::new(
+                        Some("content_block_delta"),
+                        delta_ev.to_string(),
+                    ));
+                }
+                StreamDelta::TextDelta(text) => {
+                    if !self.in_text_block && text.trim().is_empty() {
+                        continue;
+                    }
+                    self.ensure_message_start(&mut events);
+                    self.close_thinking_block_if_open(&mut events);
+                    self.close_tool_block_if_open(&mut events);
                     if !self.in_text_block {
                         self.in_text_block = true;
                         let block_start = serde_json::json!({
@@ -358,24 +401,24 @@ impl StreamFormatter for AnthropicStreamFormatter {
                 }
                 StreamDelta::ToolCallStart { index: _, id, name } => {
                     self.ensure_message_start(&mut events);
-                    if self.in_text_block {
-                        let stop = serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": self.block_index,
-                        });
-                        events.push(SseEvent::new(Some("content_block_stop"), stop.to_string()));
-                        self.block_index += 1;
-                        self.in_text_block = false;
-                    }
+                    self.close_thinking_block_if_open(&mut events);
+                    self.close_text_block_if_open(&mut events);
+                    self.close_tool_block_if_open(&mut events);
+                    let tool_use_id = if id.trim().is_empty() {
+                        format!("toolu_{}", Uuid::new_v4().simple())
+                    } else {
+                        id.clone()
+                    };
                     let block_start = serde_json::json!({
                         "type": "content_block_start",
                         "index": self.block_index,
-                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                        "content_block": {"type": "tool_use", "id": tool_use_id, "name": name, "input": {}}
                     });
                     events.push(SseEvent::new(
                         Some("content_block_start"),
                         block_start.to_string(),
                     ));
+                    self.in_tool_block = true;
                 }
                 StreamDelta::ToolCallDelta { index: _, arguments } => {
                     let delta_ev = serde_json::json!({
@@ -398,14 +441,9 @@ impl StreamFormatter for AnthropicStreamFormatter {
                 }
                 StreamDelta::Done { stop_reason } => {
                     self.ensure_message_start(&mut events);
-                    if self.in_text_block {
-                        let stop = serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": self.block_index,
-                        });
-                        events.push(SseEvent::new(Some("content_block_stop"), stop.to_string()));
-                        self.in_text_block = false;
-                    }
+                    self.close_thinking_block_if_open(&mut events);
+                    self.close_text_block_if_open(&mut events);
+                    self.close_tool_block_if_open(&mut events);
                     let anthropic_reason = match stop_reason.as_str() {
                         "stop" => "end_turn",
                         "tool_calls" => "tool_use",
@@ -434,6 +472,47 @@ impl StreamFormatter for AnthropicStreamFormatter {
 
     fn usage(&self) -> TokenUsage {
         self.usage.clone()
+    }
+}
+
+impl AnthropicStreamFormatter {
+    fn close_text_block_if_open(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.in_text_block {
+            return;
+        }
+        let stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": self.block_index,
+        });
+        events.push(SseEvent::new(Some("content_block_stop"), stop.to_string()));
+        self.block_index += 1;
+        self.in_text_block = false;
+    }
+
+    fn close_thinking_block_if_open(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.in_thinking_block {
+            return;
+        }
+        let stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": self.block_index,
+        });
+        events.push(SseEvent::new(Some("content_block_stop"), stop.to_string()));
+        self.block_index += 1;
+        self.in_thinking_block = false;
+    }
+
+    fn close_tool_block_if_open(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.in_tool_block {
+            return;
+        }
+        let stop = serde_json::json!({
+            "type": "content_block_stop",
+            "index": self.block_index,
+        });
+        events.push(SseEvent::new(Some("content_block_stop"), stop.to_string()));
+        self.block_index += 1;
+        self.in_tool_block = false;
     }
 }
 

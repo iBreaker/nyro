@@ -58,7 +58,9 @@ impl ResponseParser for GeminiResponseParser {
             id: format!("gen-{}", uuid::Uuid::new_v4().simple()),
             model,
             content: text,
+            reasoning_content: None,
             tool_calls,
+            response_items: None,
             stop_reason,
             usage,
         })
@@ -253,6 +255,15 @@ impl StreamFormatter for GeminiStreamFormatter {
             match delta {
                 StreamDelta::MessageStart { model, .. } => {
                     self.model = model.clone();
+                }
+                StreamDelta::ReasoningDelta(text) => {
+                    let chunk = serde_json::json!({
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": text}]},
+                        }],
+                        "modelVersion": self.model,
+                    });
+                    events.push(SseEvent::new(None, chunk.to_string()));
                 }
                 StreamDelta::TextDelta(text) => {
                     let chunk = serde_json::json!({

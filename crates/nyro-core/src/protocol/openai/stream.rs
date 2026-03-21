@@ -34,6 +34,7 @@ impl ResponseParser for OpenAIResponseParser {
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
+        let reasoning_content = message.and_then(extract_reasoning_from_message);
 
         let stop_reason = choice
             .and_then(|c| c.get("finish_reason"))
@@ -67,7 +68,9 @@ impl ResponseParser for OpenAIResponseParser {
             id,
             model,
             content,
+            reasoning_content,
             tool_calls,
+            response_items: None,
             stop_reason,
             usage,
         })
@@ -129,6 +132,8 @@ impl ResponseFormatter for OpenAIResponseFormatter {
 pub struct OpenAIStreamParser {
     buffer: String,
     started: bool,
+    think_buffer: String,
+    in_think_block: bool,
 }
 
 impl OpenAIStreamParser {
@@ -136,6 +141,8 @@ impl OpenAIStreamParser {
         Self {
             buffer: String::new(),
             started: false,
+            think_buffer: String::new(),
+            in_think_block: false,
         }
     }
 }
@@ -169,11 +176,13 @@ impl StreamParser for OpenAIStreamParser {
     }
 
     fn finish(&mut self) -> Result<Vec<StreamDelta>> {
-        if self.buffer.trim().is_empty() {
-            return Ok(vec![]);
+        let mut deltas = Vec::new();
+        if !self.buffer.trim().is_empty() {
+            let remaining = std::mem::take(&mut self.buffer);
+            deltas.extend(self.parse_chunk(&format!("{remaining}\n\n"))?);
         }
-        let remaining = std::mem::take(&mut self.buffer);
-        self.parse_chunk(&format!("{remaining}\n\n"))
+        deltas.extend(self.flush_pending_text());
+        Ok(deltas)
     }
 }
 
@@ -205,10 +214,13 @@ impl OpenAIStreamParser {
         };
 
         if let Some(delta) = choice.get("delta") {
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    deltas.push(StreamDelta::TextDelta(text.to_string()));
+            if let Some(reasoning) = extract_reasoning_from_message(delta) {
+                if !reasoning.is_empty() {
+                    deltas.push(StreamDelta::ReasoningDelta(reasoning));
                 }
+            }
+            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                self.parse_text_with_think_tags(text, deltas);
             }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -251,6 +263,74 @@ impl OpenAIStreamParser {
             deltas.push(StreamDelta::Usage(u));
         }
     }
+
+    fn parse_text_with_think_tags(&mut self, text: &str, deltas: &mut Vec<StreamDelta>) {
+        if text.is_empty() {
+            return;
+        }
+        self.think_buffer.push_str(text);
+
+        loop {
+            if self.in_think_block {
+                if let Some(end_idx) = self.think_buffer.find("</think>") {
+                    let thought = self.think_buffer[..end_idx].trim().to_string();
+                    if !thought.is_empty() {
+                        deltas.push(StreamDelta::ReasoningDelta(thought));
+                    }
+                    self.think_buffer = self.think_buffer[end_idx + "</think>".len()..].to_string();
+                    self.in_think_block = false;
+                    continue;
+                }
+                break;
+            }
+
+            if let Some(start_idx) = self.think_buffer.find("<think>") {
+                let before = self.think_buffer[..start_idx].to_string();
+                if !before.is_empty() {
+                    deltas.push(StreamDelta::TextDelta(before));
+                }
+                self.think_buffer = self.think_buffer[start_idx + "<think>".len()..].to_string();
+                self.in_think_block = true;
+                continue;
+            }
+
+            let keep = longest_suffix_that_can_start_tag(&self.think_buffer, "<think>");
+            if self.think_buffer.len() > keep {
+                let emit = self.think_buffer[..self.think_buffer.len() - keep].to_string();
+                if !emit.is_empty() {
+                    deltas.push(StreamDelta::TextDelta(emit));
+                }
+                self.think_buffer = self.think_buffer[self.think_buffer.len() - keep..].to_string();
+            }
+            break;
+        }
+    }
+
+    fn flush_pending_text(&mut self) -> Vec<StreamDelta> {
+        if self.think_buffer.is_empty() {
+            return vec![];
+        }
+        if self.in_think_block {
+            let mut fallback = String::from("<think>");
+            fallback.push_str(&self.think_buffer);
+            self.think_buffer.clear();
+            self.in_think_block = false;
+            vec![StreamDelta::TextDelta(fallback)]
+        } else {
+            let remaining = std::mem::take(&mut self.think_buffer);
+            vec![StreamDelta::TextDelta(remaining)]
+        }
+    }
+}
+
+fn longest_suffix_that_can_start_tag(text: &str, tag: &str) -> usize {
+    let max = std::cmp::min(text.len(), tag.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if text.ends_with(&tag[..len]) {
+            return len;
+        }
+    }
+    0
 }
 
 // ── Stream formatter (deltas → OpenAI SSE) ──
@@ -284,6 +364,15 @@ impl StreamFormatter for OpenAIStreamFormatter {
                         "object": "chat.completion.chunk",
                         "model": self.model,
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                    });
+                    events.push(SseEvent::new(None, chunk.to_string()));
+                }
+                StreamDelta::ReasoningDelta(text) => {
+                    let chunk = serde_json::json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "model": self.model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
@@ -364,5 +453,30 @@ fn extract_usage(v: &Value) -> TokenUsage {
         }
     } else {
         TokenUsage::default()
+    }
+}
+
+fn extract_reasoning_from_message(message: &Value) -> Option<String> {
+    if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
+        return Some(reasoning.to_string());
+    }
+
+    let details = message.get("reasoning_details").and_then(|v| v.as_array())?;
+    let mut parts: Vec<String> = Vec::new();
+    for detail in details {
+        if let Some(text) = detail
+            .get("text")
+            .or_else(|| detail.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
