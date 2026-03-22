@@ -1,8 +1,16 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use axum::http::{HeaderValue, Method, header};
-use nyro_core::{Gateway, config::GatewayConfig, logging};
+use nyro_core::{
+    Gateway,
+    config::{
+        GatewayConfig, GatewayStorageConfig, MongoCollectionNames, MongoStorageConfig,
+        SqlStorageConfig, SqliteStorageConfig, StorageBackendKind,
+    },
+    logging,
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod admin_routes;
@@ -44,6 +52,60 @@ struct Args {
 
     #[arg(long, default_value = "./webui/dist", help = "Path to webui static files")]
     webui_dir: String,
+
+    #[arg(long, value_parser = ["sqlite", "postgres", "mysql", "mongo"], default_value = "sqlite")]
+    storage_backend: String,
+
+    #[arg(
+        long,
+        default_value = "NYRO_STORAGE_DSN",
+        help = "Environment variable name used to load storage DSN/URI"
+    )]
+    storage_dsn_env: String,
+
+    #[arg(
+        long,
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        help = "Run SQLite migrations on startup (true/false)"
+    )]
+    sqlite_migrate_on_start: bool,
+
+    #[arg(long, default_value_t = 10)]
+    storage_max_connections: u32,
+
+    #[arg(long, default_value_t = 1)]
+    storage_min_connections: u32,
+
+    #[arg(long, default_value_t = 10)]
+    storage_acquire_timeout_secs: u64,
+
+    #[arg(long, help = "Idle timeout in seconds for SQL backends")]
+    storage_idle_timeout_secs: Option<u64>,
+
+    #[arg(long, help = "Max lifetime in seconds for SQL backends")]
+    storage_max_lifetime_secs: Option<u64>,
+
+    #[arg(long, default_value = "nyro", help = "MongoDB database name")]
+    mongo_database: String,
+
+    #[arg(long, default_value = "providers")]
+    mongo_collection_providers: String,
+
+    #[arg(long, default_value = "routes")]
+    mongo_collection_routes: String,
+
+    #[arg(long, default_value = "api_keys")]
+    mongo_collection_api_keys: String,
+
+    #[arg(long, default_value = "api_key_routes")]
+    mongo_collection_api_key_routes: String,
+
+    #[arg(long, default_value = "request_logs")]
+    mongo_collection_request_logs: String,
+
+    #[arg(long, default_value = "settings")]
+    mongo_collection_settings: String,
 }
 
 #[tokio::main]
@@ -55,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let data_dir = shellexpand::tilde(&args.data_dir).to_string();
-    let admin_key = args.admin_key.filter(|k| !k.trim().is_empty());
+    let admin_key = args.admin_key.clone().filter(|k| !k.trim().is_empty());
 
     if !is_loopback_host(&args.admin_host) && admin_key.is_none() {
         anyhow::bail!(
@@ -78,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_port: args.proxy_port,
         proxy_cors_origins,
         data_dir: PathBuf::from(data_dir),
+        storage: build_storage_config(&args)?,
         ..Default::default()
     };
 
@@ -161,4 +224,75 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
             header::HeaderName::from_static("x-api-key"),
             header::HeaderName::from_static("anthropic-version"),
         ])
+}
+
+fn build_storage_config(args: &Args) -> anyhow::Result<GatewayStorageConfig> {
+    let backend = parse_storage_backend(&args.storage_backend)?;
+    let storage_dsn = resolve_storage_dsn(args, backend)?;
+    let sql = SqlStorageConfig {
+        url: storage_dsn.clone(),
+        max_connections: args.storage_max_connections,
+        min_connections: args.storage_min_connections,
+        acquire_timeout: Duration::from_secs(args.storage_acquire_timeout_secs),
+        idle_timeout: args.storage_idle_timeout_secs.map(Duration::from_secs),
+        max_lifetime: args.storage_max_lifetime_secs.map(Duration::from_secs),
+    };
+
+    Ok(GatewayStorageConfig {
+        backend,
+        sqlite: SqliteStorageConfig {
+            migrate_on_start: args.sqlite_migrate_on_start,
+        },
+        postgres: sql.clone(),
+        mysql: sql,
+        mongo: MongoStorageConfig {
+            uri: storage_dsn,
+            database: args.mongo_database.trim().to_string(),
+            collections: MongoCollectionNames {
+                providers: args.mongo_collection_providers.trim().to_string(),
+                routes: args.mongo_collection_routes.trim().to_string(),
+                api_keys: args.mongo_collection_api_keys.trim().to_string(),
+                api_key_routes: args.mongo_collection_api_key_routes.trim().to_string(),
+                request_logs: args.mongo_collection_request_logs.trim().to_string(),
+                settings: args.mongo_collection_settings.trim().to_string(),
+            },
+        },
+    })
+}
+
+fn parse_storage_backend(value: &str) -> anyhow::Result<StorageBackendKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "sqlite" => Ok(StorageBackendKind::Sqlite),
+        "postgres" => Ok(StorageBackendKind::Postgres),
+        "mysql" => Ok(StorageBackendKind::MySql),
+        "mongo" => Ok(StorageBackendKind::Mongo),
+        other => anyhow::bail!("unsupported storage backend: {other}"),
+    }
+}
+
+fn resolve_storage_dsn(
+    args: &Args,
+    backend: StorageBackendKind,
+) -> anyhow::Result<Option<String>> {
+    if matches!(backend, StorageBackendKind::Sqlite) {
+        return Ok(None);
+    }
+
+    let env_name = args.storage_dsn_env.trim();
+    if env_name.is_empty() {
+        anyhow::bail!("--storage-dsn-env cannot be empty");
+    }
+
+    std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "storage backend {} requires env {}",
+                args.storage_backend,
+                env_name
+            )
+        })
 }
