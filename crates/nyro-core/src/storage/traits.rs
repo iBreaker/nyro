@@ -3,9 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::db::models::{
-    ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, LogPage, LogQuery, ModelStats,
-    Provider, ProviderStats, Route, StatsHourly, StatsOverview, UpdateApiKey, UpdateProvider,
-    UpdateRoute,
+    ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget, LogPage,
+    LogQuery, ModelStats, Provider, ProviderStats, Route, RouteTarget, StatsHourly, StatsOverview,
+    UpdateApiKey, UpdateProvider, UpdateRoute,
 };
 use crate::logging::LogEntry;
 
@@ -37,7 +37,6 @@ pub enum StorageBackend {
     Sqlite,
     Postgres,
     MySql,
-    Mongo,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +89,17 @@ pub trait RouteSnapshotStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait RouteTargetStore: Send + Sync {
+    async fn list_targets_by_route(&self, route_id: &str) -> anyhow::Result<Vec<RouteTarget>>;
+    async fn set_targets(
+        &self,
+        route_id: &str,
+        targets: &[CreateRouteTarget],
+    ) -> anyhow::Result<Vec<RouteTarget>>;
+    async fn delete_targets_by_route(&self, route_id: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
 pub trait SettingsStore: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()>;
@@ -137,6 +147,9 @@ pub trait Storage: Send + Sync {
     fn providers(&self) -> &dyn ProviderStore;
     fn routes(&self) -> &dyn RouteStore;
     fn snapshots(&self) -> &dyn RouteSnapshotStore;
+    fn route_targets(&self) -> Option<&dyn RouteTargetStore> {
+        None
+    }
     fn settings(&self) -> &dyn SettingsStore;
     fn api_keys(&self) -> Option<&dyn ApiKeyStore> {
         None

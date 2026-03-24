@@ -17,16 +17,12 @@ use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
 use config::{
-    GatewayConfig, MongoCollectionNames as GatewayMongoCollectionNames,
-    MongoStorageConfig as GatewayMongoStorageConfig, SqlStorageConfig,
-    StorageBackendKind,
+    GatewayConfig, SqlStorageConfig, StorageBackendKind,
 };
 use logging::LogEntry;
-use storage::mongo::{
-    MongoCollectionNames as RuntimeMongoCollectionNames, MongoStorageConfig as RuntimeMongoStorageConfig,
-};
 use storage::sql::config::SqlBackendConfig;
-use storage::{DynStorage, MongoStorage, MySqlStorage, PostgresStorage, SqliteStorage};
+use storage::{DynStorage, MySqlStorage, PostgresStorage, SqliteStorage};
+use crate::router::health::HealthRegistry;
 
 #[derive(Clone, Debug)]
 pub struct CapabilityCacheEntry {
@@ -41,6 +37,7 @@ pub struct Gateway {
     pub storage: DynStorage,
     pub http_client: reqwest::Client,
     pub route_cache: Arc<tokio::sync::RwLock<router::RouteCache>>,
+    pub health_registry: Arc<HealthRegistry>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
     pub log_tx: mpsc::Sender<LogEntry>,
 }
@@ -67,10 +64,6 @@ impl Gateway {
                 let backend_config = to_sql_backend_config(&config.storage.mysql, "mysql")?;
                 Arc::new(MySqlStorage::connect(backend_config, sqlite_fallback.clone()).await?)
             }
-            StorageBackendKind::Mongo => {
-                let backend_config = to_mongo_backend_config(&config.storage.mongo)?;
-                Arc::new(MongoStorage::connect(backend_config, sqlite_fallback.clone()).await?)
-            }
         };
 
         storage.bootstrap().init().await?;
@@ -89,6 +82,7 @@ impl Gateway {
         let route_cache = Arc::new(tokio::sync::RwLock::new(
             router::RouteCache::load(storage.snapshots()).await?,
         ));
+        let health_registry = Arc::new(HealthRegistry::new());
         let ollama_capability_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         let (log_tx, log_rx) = mpsc::channel(1024);
@@ -99,6 +93,7 @@ impl Gateway {
             storage,
             http_client,
             route_cache,
+            health_registry,
             ollama_capability_cache,
             log_tx,
         };
@@ -180,27 +175,4 @@ fn to_sql_backend_config(config: &SqlStorageConfig, backend: &str) -> anyhow::Re
         idle_timeout: config.idle_timeout,
         max_lifetime: config.max_lifetime,
     })
-}
-
-fn to_mongo_backend_config(config: &GatewayMongoStorageConfig) -> anyhow::Result<RuntimeMongoStorageConfig> {
-    let uri = config
-        .configured_uri()
-        .context("mongo backend selected but storage uri is empty")?;
-
-    Ok(RuntimeMongoStorageConfig {
-        uri,
-        database: config.database.trim().to_string(),
-        collections: to_runtime_mongo_collections(&config.collections),
-    })
-}
-
-fn to_runtime_mongo_collections(collections: &GatewayMongoCollectionNames) -> RuntimeMongoCollectionNames {
-    RuntimeMongoCollectionNames {
-        providers: collections.providers.clone(),
-        routes: collections.routes.clone(),
-        api_keys: collections.api_keys.clone(),
-        api_key_routes: collections.api_key_routes.clone(),
-        request_logs: collections.request_logs.clone(),
-        settings: collections.settings.clone(),
-    }
 }

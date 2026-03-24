@@ -32,11 +32,60 @@ pub struct Route {
     pub name: String,
     pub ingress_protocol: String,
     pub virtual_model: String,
+    pub strategy: String,
     pub target_provider: String,
     pub target_model: String,
     pub access_control: bool,
     pub is_active: bool,
     pub created_at: String,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub targets: Vec<RouteTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct RouteTarget {
+    pub id: String,
+    pub route_id: String,
+    pub provider_id: String,
+    pub model: String,
+    pub weight: i32,
+    pub priority: i32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteStrategy {
+    Weighted,
+    Priority,
+}
+
+impl Default for RouteStrategy {
+    fn default() -> Self {
+        Self::Weighted
+    }
+}
+
+impl RouteStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Weighted => "weighted",
+            Self::Priority => "priority",
+        }
+    }
+}
+
+impl std::str::FromStr for RouteStrategy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "weighted" => Ok(Self::Weighted),
+            "priority" => Ok(Self::Priority),
+            other => anyhow::bail!("unsupported route strategy: {other}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -135,8 +184,11 @@ pub struct UpdateRoute {
     pub name: Option<String>,
     pub ingress_protocol: Option<String>,
     pub virtual_model: Option<String>,
+    pub strategy: Option<String>,
     pub target_provider: Option<String>,
     pub target_model: Option<String>,
+    #[serde(default)]
+    pub targets: Option<Vec<UpsertRouteTarget>>,
     pub access_control: Option<bool>,
     pub is_active: Option<bool>,
 }
@@ -146,9 +198,29 @@ pub struct CreateRoute {
     pub name: String,
     pub ingress_protocol: String,
     pub virtual_model: String,
+    pub strategy: Option<String>,
     pub target_provider: String,
     pub target_model: String,
+    #[serde(default)]
+    pub targets: Vec<CreateRouteTarget>,
     pub access_control: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRouteTarget {
+    pub provider_id: String,
+    pub model: String,
+    pub weight: Option<i32>,
+    pub priority: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertRouteTarget {
+    pub id: Option<String>,
+    pub provider_id: String,
+    pub model: String,
+    pub weight: Option<i32>,
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

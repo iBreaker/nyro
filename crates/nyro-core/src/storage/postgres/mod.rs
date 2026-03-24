@@ -5,17 +5,17 @@ use async_trait::async_trait;
 use sqlx::{Pool, Postgres};
 
 use crate::db::models::{
-    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, LogPage, LogQuery,
-    ModelStats, Provider, ProviderStats, RequestLog, Route, StatsHourly, StatsOverview,
-    UpdateApiKey, UpdateProvider, UpdateRoute,
+    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget,
+    LogPage, LogQuery, ModelStats, Provider, ProviderStats, RequestLog, Route, RouteTarget,
+    StatsHourly, StatsOverview, UpdateApiKey, UpdateProvider, UpdateRoute,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, DynStorage, LogStore, ProviderStore,
-    ProviderTestResult, RouteSnapshotStore, RouteStore, SettingsStore, Storage, StorageBackend,
-    StorageBootstrap, StorageCapabilities, StorageHealth, UsageWindow,
+    ProviderTestResult, RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage,
+    StorageBackend, StorageBootstrap, StorageCapabilities, StorageHealth, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -68,6 +68,7 @@ impl PostgresAdapter {
 pub struct PostgresStorage {
     provider_store: Arc<PostgresProviderStore>,
     route_store: Arc<PostgresRouteStore>,
+    route_target_store: Arc<PostgresRouteTargetStore>,
     settings_store: Arc<PostgresSettingsStore>,
     api_key_store: Arc<PostgresApiKeyStore>,
     auth_store: Arc<PostgresAuthAccessStore>,
@@ -82,6 +83,9 @@ impl PostgresStorage {
             pool: adapter.pool().clone(),
         });
         let route_store = Arc::new(PostgresRouteStore {
+            pool: adapter.pool().clone(),
+        });
+        let route_target_store = Arc::new(PostgresRouteTargetStore {
             pool: adapter.pool().clone(),
         });
         let settings_store = Arc::new(PostgresSettingsStore {
@@ -100,6 +104,7 @@ impl PostgresStorage {
         Ok(Self {
             provider_store,
             route_store,
+            route_target_store,
             settings_store,
             api_key_store,
             auth_store,
@@ -124,6 +129,10 @@ impl Storage for PostgresStorage {
 
     fn settings(&self) -> &dyn SettingsStore {
         self.settings_store.as_ref()
+    }
+
+    fn route_targets(&self) -> Option<&dyn RouteTargetStore> {
+        Some(self.route_target_store.as_ref())
     }
 
     fn api_keys(&self) -> Option<&dyn ApiKeyStore> {
@@ -295,13 +304,14 @@ impl RouteStore for PostgresRouteStore {
         let ingress_protocol = input.ingress_protocol.trim().to_lowercase();
         let virtual_model = input.virtual_model.trim().to_string();
         sqlx::query(
-            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, target_provider, target_model, access_control) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, strategy, target_provider, target_model, access_control) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&id)
         .bind(input.name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(input.strategy.unwrap_or_else(|| "weighted".to_string()))
         .bind(input.target_provider.trim())
         .bind(input.target_model.trim())
         .bind(input.access_control.unwrap_or(false))
@@ -323,18 +333,20 @@ impl RouteStore for PostgresRouteStore {
             .unwrap_or(current.virtual_model)
             .trim()
             .to_string();
+        let strategy = input.strategy.unwrap_or(current.strategy);
         let target_provider = input.target_provider.unwrap_or(current.target_provider);
         let target_model = input.target_model.unwrap_or(current.target_model);
         let access_control = input.access_control.unwrap_or(current.access_control);
         let is_active = input.is_active.unwrap_or(current.is_active);
 
         sqlx::query(
-            "UPDATE routes SET name=$1, ingress_protocol=$2, virtual_model=$3, match_pattern=$4, target_provider=$5, target_model=$6, access_control=$7, is_active=$8 WHERE id=$9",
+            "UPDATE routes SET name=$1, ingress_protocol=$2, virtual_model=$3, match_pattern=$4, strategy=$5, target_provider=$6, target_model=$7, access_control=$8, is_active=$9 WHERE id=$10",
         )
         .bind(name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(strategy.trim().to_lowercase())
         .bind(target_provider.trim())
         .bind(target_model.trim())
         .bind(access_control)
@@ -414,6 +426,61 @@ impl RouteSnapshotStore for PostgresRouteStore {
         Ok(sqlx::query_as::<_, Route>(&sql)
             .fetch_all(&self.pool)
             .await?)
+    }
+}
+
+#[derive(Clone)]
+struct PostgresRouteTargetStore {
+    pool: Pool<Postgres>,
+}
+
+#[async_trait]
+impl RouteTargetStore for PostgresRouteTargetStore {
+    async fn list_targets_by_route(&self, route_id: &str) -> anyhow::Result<Vec<RouteTarget>> {
+        Ok(sqlx::query_as::<_, RouteTarget>(
+            "SELECT id, route_id, provider_id, model, weight, priority, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM route_targets WHERE route_id = $1 ORDER BY priority ASC, created_at ASC",
+        )
+        .bind(route_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn set_targets(
+        &self,
+        route_id: &str,
+        targets: &[CreateRouteTarget],
+    ) -> anyhow::Result<Vec<RouteTarget>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM route_targets WHERE route_id = $1")
+            .bind(route_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for target in targets {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id)
+            .bind(route_id)
+            .bind(target.provider_id.trim())
+            .bind(target.model.trim())
+            .bind(target.weight.unwrap_or(100).max(1))
+            .bind(target.priority.unwrap_or(1).max(1))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        self.list_targets_by_route(route_id).await
+    }
+
+    async fn delete_targets_by_route(&self, route_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM route_targets WHERE route_id = $1")
+            .bind(route_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -788,6 +855,43 @@ impl StorageBootstrap for PostgresBootstrap {
         sqlx::raw_sql(POSTGRES_INIT_SQL)
             .execute(self.adapter.pool())
             .await?;
+        sqlx::query("ALTER TABLE routes ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'weighted'")
+            .execute(self.adapter.pool())
+            .await?;
+        sqlx::query("UPDATE routes SET strategy = 'weighted' WHERE strategy IS NULL OR btrim(strategy) = ''")
+            .execute(self.adapter.pool())
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority)
+            SELECT md5(random()::text || clock_timestamp()::text), r.id, r.target_provider, r.target_model, 100, 1
+            FROM routes r
+            WHERE r.target_provider IS NOT NULL
+              AND btrim(r.target_provider) != ''
+              AND NOT EXISTS (SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id)
+            "#,
+        )
+        .execute(self.adapter.pool())
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority)
+            SELECT md5(random()::text || clock_timestamp()::text), r.id, r.fallback_provider, COALESCE(NULLIF(r.fallback_model, ''), r.target_model), 100, 2
+            FROM routes r
+            WHERE r.fallback_provider IS NOT NULL
+              AND btrim(r.fallback_provider) != ''
+              AND NOT EXISTS (
+                SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id AND rt.priority = 2
+              )
+            "#,
+        )
+        .execute(self.adapter.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE routes SET strategy = 'priority' WHERE fallback_provider IS NOT NULL AND btrim(fallback_provider) != '' AND (strategy IS NULL OR strategy = '' OR strategy = 'weighted')",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         Ok(())
     }
 
@@ -826,7 +930,7 @@ fn provider_select(suffix: Option<&str>) -> String {
 
 fn route_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, target_provider, target_model, COALESCE(access_control, false) AS access_control, is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM routes",
+        "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, COALESCE(strategy, 'weighted') AS strategy, target_provider, target_model, COALESCE(access_control, false) AS access_control, is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM routes",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -942,6 +1046,7 @@ CREATE TABLE IF NOT EXISTS routes (
     match_pattern TEXT NOT NULL,
     ingress_protocol TEXT,
     virtual_model TEXT,
+    strategy TEXT DEFAULT 'weighted',
     target_provider TEXT NOT NULL REFERENCES providers(id),
     target_model TEXT NOT NULL,
     fallback_provider TEXT REFERENCES providers(id),
@@ -951,6 +1056,18 @@ CREATE TABLE IF NOT EXISTS routes (
     priority INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS route_targets (
+    id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL REFERENCES providers(id),
+    model TEXT NOT NULL,
+    weight INTEGER DEFAULT 100,
+    priority INTEGER DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_targets_route_id ON route_targets(route_id);
 
 CREATE TABLE IF NOT EXISTS request_logs (
     id TEXT PRIMARY KEY,

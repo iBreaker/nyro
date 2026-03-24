@@ -12,7 +12,6 @@ Backends:
 - sqlite
 - postgres (requires DB_URL, falls back to /workspace/.env)
 - mysql (requires NYRO_SMOKE_MYSQL_BASE_URL / MYSQL_BASE_URL, or NYRO_SMOKE_MYSQL_URL / MYSQL_URL)
-- mongo (requires NYRO_SMOKE_MONGO_URI / MONGO_URI / MONGODB_URI / DB_MONGO_URI)
 """
 
 from __future__ import annotations
@@ -247,21 +246,6 @@ def write_harness(project_dir: Path) -> None:
                         ..Default::default()
                     };
                 }
-                "mongo" => {
-                    let uri = env::var("NYRO_SMOKE_MONGO_URI").context("missing NYRO_SMOKE_MONGO_URI")?;
-                    let database =
-                        env::var("NYRO_SMOKE_MONGO_DATABASE").context("missing NYRO_SMOKE_MONGO_DATABASE")?;
-                    ensure!(
-                        database
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                        "invalid mongo database name"
-                    );
-
-                    config.storage.backend = StorageBackendKind::Mongo;
-                    config.storage.mongo.uri = Some(uri);
-                    config.storage.mongo.database = database;
-                }
                 other => anyhow::bail!("unsupported backend: {other}"),
             }
 
@@ -450,21 +434,6 @@ def run_backend(backend: str, *, env: dict[str, str], upstream_port: int, work_d
                 "mysql smoke requires NYRO_SMOKE_MYSQL_BASE_URL / MYSQL_BASE_URL, "
                 "or NYRO_SMOKE_MYSQL_URL / MYSQL_URL / DATABASE_URL_MYSQL"
             )
-    elif backend == "mongo":
-        mongo_uri = first_env_value(
-            backend_env,
-            ["NYRO_SMOKE_MONGO_URI", "MONGO_URI", "MONGODB_URI", "DB_MONGO_URI"],
-        )
-        if not mongo_uri:
-            raise RuntimeError(
-                "mongo smoke requires NYRO_SMOKE_MONGO_URI / MONGO_URI / MONGODB_URI / DB_MONGO_URI"
-            )
-        db_prefix = first_env_value(
-            backend_env, ["NYRO_SMOKE_MONGO_DATABASE", "MONGO_DATABASE", "MONGODB_DATABASE"]
-        ) or "nyro_mongo_smoke"
-        backend_env["NYRO_SMOKE_MONGO_URI"] = mongo_uri
-        backend_env["NYRO_SMOKE_MONGO_DATABASE"] = make_isolated_name(db_prefix, "nyro_mongo_smoke")
-
     return run_cmd(
         ["cargo", "run", "--quiet", "--manifest-path", str(work_dir / "Cargo.toml")],
         env=backend_env,
@@ -477,7 +446,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         action="append",
-        choices=["sqlite", "postgres", "mysql", "mongo"],
+        choices=["sqlite", "postgres", "mysql"],
         help="Backend(s) to test. Defaults to sqlite + postgres.",
     )
     return parser.parse_args()

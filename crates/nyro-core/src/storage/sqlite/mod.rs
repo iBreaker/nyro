@@ -7,15 +7,15 @@ use sqlx::SqlitePool;
 use crate::config::GatewayConfig;
 use crate::db;
 use crate::db::models::{
-    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, LogPage, LogQuery,
-    ModelStats, Provider, ProviderStats, RequestLog, Route, StatsHourly, StatsOverview,
-    UpdateApiKey, UpdateProvider, UpdateRoute,
+    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget,
+    LogPage, LogQuery, ModelStats, Provider, ProviderStats, RequestLog, Route, RouteTarget,
+    StatsHourly, StatsOverview, UpdateApiKey, UpdateProvider, UpdateRoute,
 };
 use crate::logging::LogEntry;
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ProviderStore, ProviderTestResult,
-    RouteSnapshotStore, RouteStore, SettingsStore, Storage, StorageBackend, StorageBootstrap,
-    StorageCapabilities, StorageHealth, UsageWindow,
+    RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage, StorageBackend,
+    StorageBootstrap, StorageCapabilities, StorageHealth, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -23,6 +23,7 @@ pub struct SqliteStorage {
     pool: SqlitePool,
     provider_store: Arc<SqliteProviderStore>,
     route_store: Arc<SqliteRouteStore>,
+    route_target_store: Arc<SqliteRouteTargetStore>,
     settings_store: Arc<SqliteSettingsStore>,
     api_key_store: Arc<SqliteApiKeyStore>,
     auth_store: Arc<SqliteAuthAccessStore>,
@@ -41,6 +42,7 @@ impl SqliteStorage {
     pub fn from_pool(pool: SqlitePool) -> Self {
         let provider_store = Arc::new(SqliteProviderStore { pool: pool.clone() });
         let route_store = Arc::new(SqliteRouteStore { pool: pool.clone() });
+        let route_target_store = Arc::new(SqliteRouteTargetStore { pool: pool.clone() });
         let settings_store = Arc::new(SqliteSettingsStore { pool: pool.clone() });
         let api_key_store = Arc::new(SqliteApiKeyStore { pool: pool.clone() });
         let auth_store = Arc::new(SqliteAuthAccessStore { pool: pool.clone() });
@@ -50,6 +52,7 @@ impl SqliteStorage {
             pool,
             provider_store,
             route_store,
+            route_target_store,
             settings_store,
             api_key_store,
             auth_store,
@@ -78,6 +81,10 @@ impl Storage for SqliteStorage {
 
     fn settings(&self) -> &dyn SettingsStore {
         self.settings_store.as_ref()
+    }
+
+    fn route_targets(&self) -> Option<&dyn RouteTargetStore> {
+        Some(self.route_target_store.as_ref())
     }
 
     fn api_keys(&self) -> Option<&dyn ApiKeyStore> {
@@ -245,7 +252,7 @@ struct SqliteRouteStore {
 impl RouteStore for SqliteRouteStore {
     async fn list(&self) -> anyhow::Result<Vec<Route>> {
         Ok(sqlx::query_as::<_, Route>(
-            "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, target_provider, target_model, COALESCE(access_control, 0) AS access_control, is_active, created_at FROM routes ORDER BY created_at DESC",
+            "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, COALESCE(strategy, 'weighted') AS strategy, target_provider, target_model, COALESCE(access_control, 0) AS access_control, is_active, created_at FROM routes ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -253,7 +260,7 @@ impl RouteStore for SqliteRouteStore {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Route>> {
         Ok(sqlx::query_as::<_, Route>(
-            "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, target_provider, target_model, COALESCE(access_control, 0) AS access_control, is_active, created_at FROM routes WHERE id = ?",
+            "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, COALESCE(strategy, 'weighted') AS strategy, target_provider, target_model, COALESCE(access_control, 0) AS access_control, is_active, created_at FROM routes WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -265,13 +272,14 @@ impl RouteStore for SqliteRouteStore {
         let ingress_protocol = input.ingress_protocol.trim().to_lowercase();
         let virtual_model = input.virtual_model.trim().to_string();
         sqlx::query(
-            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, target_provider, target_model, access_control) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, strategy, target_provider, target_model, access_control) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(input.strategy.unwrap_or_else(|| "weighted".to_string()))
         .bind(input.target_provider.trim())
         .bind(input.target_model.trim())
         .bind(input.access_control.unwrap_or(false))
@@ -293,18 +301,20 @@ impl RouteStore for SqliteRouteStore {
             .unwrap_or(current.virtual_model)
             .trim()
             .to_string();
+        let strategy = input.strategy.unwrap_or(current.strategy);
         let target_provider = input.target_provider.unwrap_or(current.target_provider);
         let target_model = input.target_model.unwrap_or(current.target_model);
         let access_control = input.access_control.unwrap_or(current.access_control);
         let is_active = input.is_active.unwrap_or(current.is_active);
 
         sqlx::query(
-            "UPDATE routes SET name=?, ingress_protocol=?, virtual_model=?, match_pattern=?, target_provider=?, target_model=?, access_control=?, is_active=? WHERE id=?",
+            "UPDATE routes SET name=?, ingress_protocol=?, virtual_model=?, match_pattern=?, strategy=?, target_provider=?, target_model=?, access_control=?, is_active=? WHERE id=?",
         )
         .bind(name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(strategy.trim().to_lowercase())
         .bind(target_provider.trim())
         .bind(target_model.trim())
         .bind(access_control)
@@ -386,6 +396,7 @@ impl RouteSnapshotStore for SqliteRouteStore {
             r#"SELECT
                 id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol,
                 COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model,
+                COALESCE(strategy, 'weighted') AS strategy,
                 target_provider, target_model,
                 COALESCE(access_control, 0) AS access_control,
                 is_active,
@@ -395,6 +406,61 @@ impl RouteSnapshotStore for SqliteRouteStore {
         )
         .fetch_all(&self.pool)
         .await?)
+    }
+}
+
+#[derive(Clone)]
+struct SqliteRouteTargetStore {
+    pool: SqlitePool,
+}
+
+#[async_trait]
+impl RouteTargetStore for SqliteRouteTargetStore {
+    async fn list_targets_by_route(&self, route_id: &str) -> anyhow::Result<Vec<RouteTarget>> {
+        Ok(sqlx::query_as::<_, RouteTarget>(
+            "SELECT id, route_id, provider_id, model, weight, priority, created_at FROM route_targets WHERE route_id = ? ORDER BY priority ASC, created_at ASC",
+        )
+        .bind(route_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn set_targets(
+        &self,
+        route_id: &str,
+        targets: &[CreateRouteTarget],
+    ) -> anyhow::Result<Vec<RouteTarget>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
+            .bind(route_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for target in targets {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(route_id)
+            .bind(target.provider_id.trim())
+            .bind(target.model.trim())
+            .bind(target.weight.unwrap_or(100).max(1))
+            .bind(target.priority.unwrap_or(1).max(1))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        self.list_targets_by_route(route_id).await
+    }
+
+    async fn delete_targets_by_route(&self, route_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
+            .bind(route_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

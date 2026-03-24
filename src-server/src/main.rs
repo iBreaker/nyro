@@ -6,8 +6,8 @@ use axum::http::{HeaderValue, Method, header};
 use nyro_core::{
     Gateway,
     config::{
-        GatewayConfig, GatewayStorageConfig, MongoCollectionNames, MongoStorageConfig,
-        SqlStorageConfig, SqliteStorageConfig, StorageBackendKind,
+        GatewayConfig, GatewayStorageConfig, SqlStorageConfig, SqliteStorageConfig,
+        StorageBackendKind,
     },
     logging,
 };
@@ -53,7 +53,7 @@ struct Args {
     #[arg(long, default_value = "./webui/dist", help = "Path to webui static files")]
     webui_dir: String,
 
-    #[arg(long, value_parser = ["sqlite", "postgres", "mysql", "mongo"], default_value = "sqlite")]
+    #[arg(long, value_parser = ["sqlite", "postgres", "mysql"], default_value = "sqlite")]
     storage_backend: String,
 
     #[arg(
@@ -86,26 +86,6 @@ struct Args {
     #[arg(long, help = "Max lifetime in seconds for SQL backends")]
     storage_max_lifetime_secs: Option<u64>,
 
-    #[arg(long, default_value = "nyro", help = "MongoDB database name")]
-    mongo_database: String,
-
-    #[arg(long, default_value = "providers")]
-    mongo_collection_providers: String,
-
-    #[arg(long, default_value = "routes")]
-    mongo_collection_routes: String,
-
-    #[arg(long, default_value = "api_keys")]
-    mongo_collection_api_keys: String,
-
-    #[arg(long, default_value = "api_key_routes")]
-    mongo_collection_api_key_routes: String,
-
-    #[arg(long, default_value = "request_logs")]
-    mongo_collection_request_logs: String,
-
-    #[arg(long, default_value = "settings")]
-    mongo_collection_settings: String,
 }
 
 #[tokio::main]
@@ -245,18 +225,6 @@ fn build_storage_config(args: &Args) -> anyhow::Result<GatewayStorageConfig> {
         },
         postgres: sql.clone(),
         mysql: sql,
-        mongo: MongoStorageConfig {
-            uri: storage_dsn,
-            database: args.mongo_database.trim().to_string(),
-            collections: MongoCollectionNames {
-                providers: args.mongo_collection_providers.trim().to_string(),
-                routes: args.mongo_collection_routes.trim().to_string(),
-                api_keys: args.mongo_collection_api_keys.trim().to_string(),
-                api_key_routes: args.mongo_collection_api_key_routes.trim().to_string(),
-                request_logs: args.mongo_collection_request_logs.trim().to_string(),
-                settings: args.mongo_collection_settings.trim().to_string(),
-            },
-        },
     })
 }
 
@@ -265,7 +233,6 @@ fn parse_storage_backend(value: &str) -> anyhow::Result<StorageBackendKind> {
         "sqlite" => Ok(StorageBackendKind::Sqlite),
         "postgres" => Ok(StorageBackendKind::Postgres),
         "mysql" => Ok(StorageBackendKind::MySql),
-        "mongo" => Ok(StorageBackendKind::Mongo),
         other => anyhow::bail!("unsupported storage backend: {other}"),
     }
 }

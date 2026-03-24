@@ -4,7 +4,16 @@ import { ChevronLeft, ChevronRight, Pencil, Plus, Route as RouteIcon, Trash2, X 
 
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import type { CreateRoute, ModelCapabilities, Provider, Route as RouteType, UpdateRoute } from "@/lib/types";
+import type {
+  CreateRoute,
+  CreateRouteTarget,
+  ModelCapabilities,
+  Provider,
+  Route as RouteType,
+  RouteStrategy,
+  UpdateRoute,
+  UpsertRouteTarget,
+} from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Input } from "@/components/ui/input";
@@ -27,17 +36,25 @@ type RouteForm = {
   name: string;
   ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
-  target_provider: string;
-  target_model: string;
+  strategy: RouteStrategy;
+  targets: RouteTargetForm[];
   access_control: boolean;
+};
+
+type RouteTargetForm = {
+  id?: string;
+  provider_id: string;
+  model: string;
+  weight: number;
+  priority: number;
 };
 
 const emptyCreate: RouteForm = {
   name: "",
   ingress_protocol: "openai",
   virtual_model: "",
-  target_provider: "",
-  target_model: "",
+  strategy: "weighted",
+  targets: [{ provider_id: "", model: "", weight: 100, priority: 1 }],
   access_control: false,
 };
 
@@ -45,37 +62,201 @@ function FieldLabel({ children }: { children: string }) {
   return <label className="ml-1 text-xs leading-none font-normal text-slate-900">{children}</label>;
 }
 
-function ModelCapabilitiesPanel({ caps, isZh }: { caps: ModelCapabilities; isZh: boolean }) {
-  const formatCost = (value?: number | null) => {
-    if (value == null) return null;
-    if (value <= 0) return "$0.0/M";
-    return `$${value}/M`;
-  };
+function protocolLabel(value: "openai" | "anthropic" | "gemini") {
+  if (value === "anthropic") return "Anthropic";
+  if (value === "gemini") return "Gemini";
+  return "OpenAI";
+}
 
+function strategyLabel(value: RouteStrategy, isZh: boolean) {
+  if (value === "priority") return isZh ? "主备分级" : "Priority";
+  return isZh ? "加权轮询" : "Weighted";
+}
+
+function hasProviderModelsEndpoint(provider?: Provider) {
+  return Boolean(provider?.models_source?.trim() || provider?.models_endpoint?.trim());
+}
+
+function withCurrentModel(options: string[], current?: string) {
+  if (!current || options.includes(current)) return options;
+  return [current, ...options];
+}
+
+function ModelCapabilitySummary({ caps, isZh }: { caps: ModelCapabilities; isZh: boolean }) {
   return (
-    <div className="h-10 w-full rounded-md border border-slate-200 bg-slate-50 px-3 text-xs text-slate-600">
-      <div className="flex h-full items-center gap-2 overflow-x-auto whitespace-nowrap">
+    <div className="mt-2 flex items-center gap-1.5 border-t border-slate-200 pt-2">
+      <div className="flex flex-wrap items-center gap-1.5">
         {caps.tool_call && <Badge variant="success">{isZh ? "工具调用" : "Tools"}</Badge>}
         {caps.reasoning && <Badge variant="success">{isZh ? "推理" : "Reasoning"}</Badge>}
         {caps.input_modalities.includes("image") && <Badge variant="success">{isZh ? "视觉" : "Vision"}</Badge>}
-        <span>
-          {isZh ? "上下文" : "Ctx"}: {Math.round(caps.context_window / 1024)}K
-        </span>
-        {formatCost(caps.input_cost) && (
-          <span>{isZh ? "输入" : "In"}: {formatCost(caps.input_cost)}</span>
-        )}
-        {formatCost(caps.output_cost) && (
-          <span>{isZh ? "输出" : "Out"}: {formatCost(caps.output_cost)}</span>
-        )}
+        <Badge variant="success">{Math.round(caps.context_window / 1024)}K</Badge>
       </div>
     </div>
   );
 }
 
-function protocolLabel(value: RouteForm["ingress_protocol"]) {
-  if (value === "anthropic") return "Anthropic";
-  if (value === "gemini") return "Gemini";
-  return "OpenAI";
+type TargetRowProps = {
+  mode: "create" | "edit";
+  index: number;
+  target: RouteTargetForm;
+  strategy: RouteStrategy;
+  isZh: boolean;
+  providerOptions: Array<{ value: string; label: string; provider: Provider }>;
+  providerMap: Map<string, Provider>;
+  onUpdate: (index: number, patch: Partial<RouteTargetForm>) => void;
+  onRemove: (index: number) => void;
+  disableRemove: boolean;
+};
+
+function TargetRow({
+  mode,
+  index,
+  target,
+  strategy,
+  isZh,
+  providerOptions,
+  providerMap,
+  onUpdate,
+  onRemove,
+  disableRemove,
+}: TargetRowProps) {
+  const [capsQueryModel, setCapsQueryModel] = useState("");
+  const provider = providerMap.get(target.provider_id);
+  const providerHasModelDiscovery = hasProviderModelsEndpoint(provider);
+
+  const { data: targetModels = [] } = useQuery<string[]>({
+    queryKey: ["provider-models", mode, index, target.provider_id],
+    queryFn: () => backend("get_provider_models", { id: target.provider_id }),
+    enabled: !!target.provider_id && providerHasModelDiscovery,
+    staleTime: 60_000,
+  });
+
+  useEffect(() => {
+    if (!target.provider_id || !providerHasModelDiscovery) {
+      setCapsQueryModel("");
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      setCapsQueryModel(target.model.trim());
+    }, 1000);
+    return () => window.clearTimeout(handle);
+  }, [target.provider_id, target.model, providerHasModelDiscovery]);
+
+  const { data: modelCaps } = useQuery<ModelCapabilities | null>({
+    queryKey: ["model-capabilities", mode, index, target.provider_id, capsQueryModel],
+    queryFn: async () => {
+      if (!target.provider_id || !capsQueryModel.trim()) return null;
+      try {
+        return await backend<ModelCapabilities>("get_model_capabilities", {
+          providerId: target.provider_id,
+          model: capsQueryModel.trim(),
+        });
+      } catch {
+        return null;
+      }
+    },
+    enabled: Boolean(target.provider_id && capsQueryModel.trim() && providerHasModelDiscovery),
+    retry: false,
+    staleTime: 60_000,
+  });
+
+  const rowClassName = strategy === "weighted"
+    ? "grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_minmax(0,1.25fr)_32px] items-center gap-2.5"
+    : "grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_minmax(0,1.25fr)_32px] items-center gap-2.5";
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white px-3 py-2.5">
+      <div className={rowClassName}>
+        <Select
+          value={target.provider_id || undefined}
+          onValueChange={(value) => {
+            onUpdate(index, { provider_id: value, model: "" });
+            setCapsQueryModel("");
+          }}
+        >
+          <SelectTrigger className="bg-white">
+            <SelectValue placeholder={isZh ? "选择提供商" : "Select provider"} />
+          </SelectTrigger>
+          <SelectContent>
+            {providerOptions.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                <span className="flex items-center gap-2">
+                  <ProviderIcon
+                    name={option.provider.name}
+                    protocol={option.provider.protocol}
+                    baseUrl={option.provider.base_url}
+                    size={16}
+                  />
+                  <span>{option.label}</span>
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        {providerHasModelDiscovery ? (
+          <Combobox
+            value={target.model}
+            className="bg-white"
+            options={withCurrentModel(targetModels, target.model).map((model) => ({
+              value: model,
+              label: model,
+            }))}
+            placeholder={isZh ? "选择目标模型 ID" : "Select target model ID"}
+            searchPlaceholder={isZh ? "搜索模型..." : "Search model..."}
+            emptyText={isZh ? "暂无可用模型" : "No models available"}
+            onValueChange={(value) => {
+              onUpdate(index, { model: value });
+              setCapsQueryModel(value.trim());
+            }}
+          />
+        ) : (
+          <Input
+            className="bg-white"
+            value={target.model}
+            onChange={(e) => onUpdate(index, { model: e.target.value })}
+            placeholder={isZh ? "目标模型 ID" : "Target model ID"}
+          />
+        )}
+
+        {strategy === "weighted" ? (
+          <Input
+            className="bg-white"
+            type="number"
+            min={1}
+            value={target.weight}
+            onChange={(e) => onUpdate(index, { weight: Math.max(1, Number(e.target.value || 1)) })}
+            placeholder={isZh ? "权重" : "Weight"}
+          />
+        ) : (
+          <Select
+            value={String(target.priority)}
+            onValueChange={(value) => onUpdate(index, { priority: Number(value) })}
+          >
+            <SelectTrigger className="bg-white">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">{isZh ? "主" : "Primary"}</SelectItem>
+              <SelectItem value="2">{isZh ? "备" : "Fallback"}</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
+
+        <button
+          type="button"
+          onClick={() => onRemove(index)}
+          disabled={disableRemove}
+          className="cursor-pointer rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Trash2 className="h-4 w-4" />
+        </button>
+      </div>
+      {modelCaps && (
+        <ModelCapabilitySummary caps={modelCaps} isZh={isZh} />
+      )}
+    </div>
+  );
 }
 
 export default function RoutesPage() {
@@ -88,8 +269,6 @@ export default function RoutesPage() {
   const [page, setPage] = useState(0);
   const [createForm, setCreateForm] = useState<RouteForm>(emptyCreate);
   const [editForm, setEditForm] = useState<(RouteForm & { id: string }) | null>(null);
-  const [createCapsQueryModel, setCreateCapsQueryModel] = useState("");
-  const [editCapsQueryModel, setEditCapsQueryModel] = useState("");
   const [editError, setEditError] = useState<string | null>(null);
   const [routeToDelete, setRouteToDelete] = useState<RouteType | null>(null);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
@@ -146,85 +325,11 @@ export default function RoutesPage() {
     },
   });
 
-  const providerOptions = useMemo(
-    () =>
-      providers
-        .filter((p) => p.last_test_success === true)
-        .map((p) => ({ value: p.id, label: p.name, provider: p })),
-    [providers],
-  );
+  const providerOptions = useMemo(() => providers.map((p) => ({ value: p.id, label: p.name, provider: p })), [providers]);
   const providerMap = useMemo(
     () => new Map(providers.map((p) => [p.id, p])),
     [providers],
   );
-
-  function hasProviderModelsEndpoint(provider?: Provider) {
-    return Boolean(provider?.models_source?.trim() || provider?.models_endpoint?.trim());
-  }
-  function withCurrentModel(options: string[], current?: string) {
-    if (!current || options.includes(current)) return options;
-    return [current, ...options];
-  }
-
-  const createProvider = providerMap.get(createForm.target_provider);
-  const editProvider = editForm ? providerMap.get(editForm.target_provider) : undefined;
-  const createProviderHasModelDiscovery = hasProviderModelsEndpoint(createProvider);
-  const editProviderHasModelDiscovery = hasProviderModelsEndpoint(editProvider);
-
-  const { data: createTargetModels = [] } = useQuery<string[]>({
-    queryKey: ["provider-models", createForm.target_provider],
-    queryFn: () => backend("get_provider_models", { id: createForm.target_provider }),
-    enabled: !!createForm.target_provider && createProviderHasModelDiscovery,
-    staleTime: 60_000,
-  });
-  const { data: editTargetModels = [] } = useQuery<string[]>({
-    queryKey: ["provider-models", editForm?.target_provider],
-    queryFn: () => backend("get_provider_models", { id: editForm?.target_provider }),
-    enabled: !!editForm?.target_provider && editProviderHasModelDiscovery,
-    staleTime: 60_000,
-  });
-  const { data: createModelCaps } = useQuery<ModelCapabilities | null>({
-    queryKey: ["model-capabilities", createForm.target_provider, createCapsQueryModel],
-    queryFn: async () => {
-      if (!createForm.target_provider || !createCapsQueryModel.trim()) return null;
-      try {
-        return await backend<ModelCapabilities>("get_model_capabilities", {
-          providerId: createForm.target_provider,
-          model: createCapsQueryModel.trim(),
-        });
-      } catch {
-        return null;
-      }
-    },
-    enabled: Boolean(
-      createForm.target_provider &&
-      createCapsQueryModel.trim() &&
-      createProviderHasModelDiscovery,
-    ),
-    retry: false,
-    staleTime: 60_000,
-  });
-  const { data: editModelCaps } = useQuery<ModelCapabilities | null>({
-    queryKey: ["model-capabilities", editForm?.target_provider, editCapsQueryModel],
-    queryFn: async () => {
-      if (!editForm?.target_provider || !editCapsQueryModel.trim()) return null;
-      try {
-        return await backend<ModelCapabilities>("get_model_capabilities", {
-          providerId: editForm.target_provider,
-          model: editCapsQueryModel.trim(),
-        });
-      } catch {
-        return null;
-      }
-    },
-    enabled: Boolean(
-      editForm?.target_provider &&
-      editCapsQueryModel.trim() &&
-      editProviderHasModelDiscovery,
-    ),
-    retry: false,
-    staleTime: 60_000,
-  });
 
   const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
   const pagedRoutes = routes.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
@@ -233,85 +338,71 @@ export default function RoutesPage() {
     if (page > totalPages - 1) setPage(0);
   }, [page, totalPages]);
 
-  useEffect(() => {
-    if (!createForm.target_provider || !createProviderHasModelDiscovery) {
-      setCreateCapsQueryModel("");
-      return;
-    }
-    const handle = window.setTimeout(() => {
-      setCreateCapsQueryModel(createForm.target_model.trim());
-    }, 1000);
-    return () => window.clearTimeout(handle);
-  }, [
-    createForm.target_provider,
-    createForm.target_model,
-    createProviderHasModelDiscovery,
-  ]);
-
-  useEffect(() => {
-    if (!editForm?.target_provider || !editProviderHasModelDiscovery) {
-      setEditCapsQueryModel("");
-      return;
-    }
-    const handle = window.setTimeout(() => {
-      setEditCapsQueryModel(editForm.target_model.trim());
-    }, 1000);
-    return () => window.clearTimeout(handle);
-  }, [
-    editForm?.target_provider,
-    editForm?.target_model,
-    editProviderHasModelDiscovery,
-  ]);
-
   function startEdit(route: RouteType) {
     setEditingId(route.id);
     setEditError(null);
-    setEditCapsQueryModel("");
+    const targets = route.targets?.length
+      ? route.targets.map((t) => ({
+          id: t.id,
+          provider_id: t.provider_id,
+          model: t.model,
+          weight: t.weight ?? 100,
+          priority: t.priority ?? 1,
+        }))
+      : [{ provider_id: route.target_provider, model: route.target_model, weight: 100, priority: 1 }];
     setEditForm({
       id: route.id,
       name: route.name,
       ingress_protocol: route.ingress_protocol,
       virtual_model: route.virtual_model,
-      target_provider: route.target_provider,
-      target_model: route.target_model,
+      strategy: route.strategy ?? "weighted",
+      targets,
       access_control: route.access_control,
     });
   }
 
-  function setCreateTargetModel(nextTargetModel: string) {
-    setCreateCapsQueryModel("");
-    setCreateForm((prev) => {
-      const shouldInherit =
-        !prev.virtual_model.trim() || prev.virtual_model.trim() === prev.target_model.trim();
-      return {
-        ...prev,
-        target_model: nextTargetModel,
-        virtual_model: shouldInherit ? nextTargetModel : prev.virtual_model,
-      };
-    });
+  function updateCreateTarget(index: number, patch: Partial<RouteTargetForm>) {
+    setCreateForm((prev) => ({
+      ...prev,
+      targets: prev.targets.map((target, idx) => (idx === index ? { ...target, ...patch } : target)),
+    }));
   }
 
-  function setEditTargetModel(nextTargetModel: string) {
-    setEditCapsQueryModel("");
+  function updateEditTarget(index: number, patch: Partial<RouteTargetForm>) {
     setEditForm((prev) => {
       if (!prev) return prev;
-      const shouldInherit = !prev.virtual_model.trim();
       return {
         ...prev,
-        target_model: nextTargetModel,
-        virtual_model: shouldInherit ? nextTargetModel : prev.virtual_model,
+        targets: prev.targets.map((target, idx) => (idx === index ? { ...target, ...patch } : target)),
       };
     });
   }
 
-  function selectCreateTargetModel(nextTargetModel: string) {
-    setCreateTargetModel(nextTargetModel);
-    setCreateCapsQueryModel(nextTargetModel.trim());
+  function addCreateTarget() {
+    setCreateForm((prev) => ({
+      ...prev,
+      targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1 }],
+    }));
   }
 
-  function selectEditTargetModel(nextTargetModel: string) {
-    setEditTargetModel(nextTargetModel);
-    setEditCapsQueryModel(nextTargetModel.trim());
+  function addEditTarget() {
+    setEditForm((prev) => (prev
+      ? { ...prev, targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1 }] }
+      : prev));
+  }
+
+  function removeCreateTarget(index: number) {
+    setCreateForm((prev) => {
+      if (prev.targets.length <= 1) return prev;
+      return { ...prev, targets: prev.targets.filter((_, idx) => idx !== index) };
+    });
+  }
+
+  function removeEditTarget(index: number) {
+    setEditForm((prev) => {
+      if (!prev || prev.targets.length <= 1) return prev;
+      return { ...prev, targets: prev.targets.filter((_, idx) => idx !== index) };
+    });
   }
 
   function providerName(id: string) {
@@ -371,67 +462,6 @@ export default function RoutesPage() {
               </Select>
             </div>
             <div className="space-y-2">
-              <FieldLabel>{isZh ? "目标提供商" : "Target Provider"}</FieldLabel>
-              <Select
-                value={createForm.target_provider || undefined}
-                onValueChange={(value) =>
-                  setCreateForm((prev) => {
-                    setCreateCapsQueryModel("");
-                    return {
-                      ...prev,
-                      target_provider: value,
-                      target_model: "",
-                      virtual_model: "",
-                    };
-                  })
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder={isZh ? "选择提供商" : "Select provider"} />
-                </SelectTrigger>
-                <SelectContent>
-                  {providerOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      <span className="flex items-center gap-2">
-                        <ProviderIcon
-                          name={option.provider.name}
-                          protocol={option.provider.protocol}
-                          baseUrl={option.provider.base_url}
-                          size={16}
-                        />
-                        <span>{option.label}</span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            {hasProviderModelsEndpoint(createProvider) ? (
-              <div className="space-y-2">
-                <FieldLabel>{isZh ? "目标模型 ID" : "Target Model ID"}</FieldLabel>
-                <Combobox
-                  value={createForm.target_model}
-                  options={withCurrentModel(createTargetModels, createForm.target_model).map((model) => ({
-                    value: model,
-                    label: model,
-                  }))}
-                  placeholder={isZh ? "选择目标模型 ID" : "Select target model ID"}
-                  searchPlaceholder={isZh ? "搜索模型..." : "Search model..."}
-                  emptyText={isZh ? "暂无可用模型" : "No models available"}
-                  onValueChange={selectCreateTargetModel}
-                />
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <FieldLabel>{isZh ? "目标模型 ID" : "Target Model ID"}</FieldLabel>
-                <Input
-                  value={createForm.target_model}
-                  onChange={(e) => setCreateTargetModel(e.target.value)}
-                  placeholder={isZh ? "输入目标模型 ID" : "Enter target model ID"}
-                />
-              </div>
-            )}
-            <div className="space-y-2">
               <FieldLabel>{isZh ? "虚拟模型 ID" : "Virtual Model ID"}</FieldLabel>
               <Input
                 value={createForm.virtual_model}
@@ -439,12 +469,57 @@ export default function RoutesPage() {
                 placeholder={isZh ? "客户端请求中的模型 ID（精确匹配）" : "Client model ID (exact match)"}
               />
             </div>
-            {createModelCaps && (
-              <div className="space-y-2 col-start-2">
-                <FieldLabel>{isZh ? "目标模型能力" : "Target Model Capabilities"}</FieldLabel>
-                <ModelCapabilitiesPanel caps={createModelCaps} isZh={isZh} />
+            <div className="space-y-2">
+              <FieldLabel>{isZh ? "负载策略" : "Load Strategy"}</FieldLabel>
+              <Select
+                value={createForm.strategy}
+                onValueChange={(value: RouteStrategy) =>
+                  setCreateForm((prev) => ({ ...prev, strategy: value }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
+                  <SelectItem value="priority">{isZh ? "主备分级" : "Priority"}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="col-span-2 space-y-2">
+              <div className="flex items-center justify-between">
+                <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                <span className="text-xs text-slate-500">
+                  {isZh ? `共 ${createForm.targets.length} 个节点` : `${createForm.targets.length} nodes`}
+                </span>
               </div>
-            )}
+              <div className="space-y-2.5 rounded-2xl border border-slate-200/90 bg-white/80 p-3">
+                {createForm.targets.map((target, index) => (
+                  <TargetRow
+                    key={index}
+                    mode="create"
+                    index={index}
+                    target={target}
+                    strategy={createForm.strategy}
+                    isZh={isZh}
+                    providerOptions={providerOptions}
+                    providerMap={providerMap}
+                    onUpdate={updateCreateTarget}
+                    onRemove={removeCreateTarget}
+                    disableRemove={createForm.targets.length <= 1}
+                  />
+                ))}
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={addCreateTarget}
+                  className="h-10 w-full justify-center rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                >
+                  <Plus className="mr-2 h-4 w-4" />
+                  {isZh ? "添加模型" : "Add model"}
+                </Button>
+              </div>
+            </div>
             <div className="col-span-2 space-y-2">
               <FieldLabel>{isZh ? "访问控制（需 API Key）" : "Access Control (API Key required)"}</FieldLabel>
               <div className="pt-1">
@@ -459,21 +534,13 @@ export default function RoutesPage() {
           <div className="flex gap-3">
             <Button
               onClick={() =>
-                createMut.mutate({
-                  name: createForm.name.trim(),
-                  ingress_protocol: createForm.ingress_protocol,
-                  virtual_model: createForm.virtual_model.trim(),
-                  target_provider: createForm.target_provider,
-                  target_model: createForm.target_model.trim(),
-                  access_control: createForm.access_control,
-                })
+                createMut.mutate(buildCreatePayload(createForm))
               }
               disabled={
                 createMut.isPending ||
                 !createForm.name.trim() ||
                 !createForm.virtual_model.trim() ||
-                !createForm.target_provider ||
-                !createForm.target_model.trim()
+                createForm.targets.some((target) => !target.provider_id || !target.model.trim())
               }
             >
               {createMut.isPending ? (isZh ? "创建中..." : "Creating...") : (isZh ? "创建" : "Create")}
@@ -547,67 +614,6 @@ export default function RoutesPage() {
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <FieldLabel>{isZh ? "目标提供商" : "Target Provider"}</FieldLabel>
-                      <Select
-                        value={editForm.target_provider}
-                        onValueChange={(value) =>
-                          setEditForm((prev) => {
-                            setEditCapsQueryModel("");
-                            return prev
-                              ? {
-                                  ...prev,
-                                  target_provider: value,
-                                  target_model: "",
-                                }
-                              : prev;
-                          })
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {providerOptions.map((option) => (
-                            <SelectItem key={option.value} value={option.value}>
-                              <span className="flex items-center gap-2">
-                                <ProviderIcon
-                                  name={option.provider.name}
-                                  protocol={option.provider.protocol}
-                                  baseUrl={option.provider.base_url}
-                                  size={16}
-                                />
-                                <span>{option.label}</span>
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    {hasProviderModelsEndpoint(editProvider) ? (
-                      <div className="space-y-2">
-                        <FieldLabel>{isZh ? "目标模型 ID" : "Target Model ID"}</FieldLabel>
-                        <Combobox
-                          value={editForm.target_model}
-                          options={withCurrentModel(editTargetModels, editForm.target_model).map((model) => ({
-                            value: model,
-                            label: model,
-                          }))}
-                          placeholder={isZh ? "选择目标模型 ID" : "Select target model ID"}
-                          searchPlaceholder={isZh ? "搜索模型..." : "Search model..."}
-                          emptyText={isZh ? "暂无可用模型" : "No models available"}
-                          onValueChange={selectEditTargetModel}
-                        />
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <FieldLabel>{isZh ? "目标模型 ID" : "Target Model ID"}</FieldLabel>
-                        <Input
-                          value={editForm.target_model}
-                          onChange={(e) => setEditTargetModel(e.target.value)}
-                        />
-                      </div>
-                    )}
-                    <div className="space-y-2">
                       <FieldLabel>{isZh ? "虚拟模型 ID" : "Virtual Model ID"}</FieldLabel>
                       <Input
                         value={editForm.virtual_model}
@@ -616,12 +622,57 @@ export default function RoutesPage() {
                         }
                       />
                     </div>
-                    {editModelCaps && (
-                      <div className="space-y-2 col-start-2">
-                        <FieldLabel>{isZh ? "目标模型能力" : "Target Model Capabilities"}</FieldLabel>
-                        <ModelCapabilitiesPanel caps={editModelCaps} isZh={isZh} />
+                    <div className="space-y-2">
+                      <FieldLabel>{isZh ? "负载策略" : "Load Strategy"}</FieldLabel>
+                      <Select
+                        value={editForm.strategy}
+                        onValueChange={(value: RouteStrategy) =>
+                          setEditForm((prev) => (prev ? { ...prev, strategy: value } : prev))
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
+                          <SelectItem value="priority">{isZh ? "主备分级" : "Priority"}</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="col-span-2 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                        <span className="text-xs text-slate-500">
+                          {isZh ? `共 ${editForm.targets.length} 个节点` : `${editForm.targets.length} nodes`}
+                        </span>
                       </div>
-                    )}
+                      <div className="space-y-2.5 rounded-2xl border border-slate-200/90 bg-white/80 p-3">
+                        {editForm.targets.map((target, index) => (
+                          <TargetRow
+                            key={`${target.id ?? "new"}-${index}`}
+                            mode="edit"
+                            index={index}
+                            target={target}
+                            strategy={editForm.strategy}
+                            isZh={isZh}
+                            providerOptions={providerOptions}
+                            providerMap={providerMap}
+                            onUpdate={updateEditTarget}
+                            onRemove={removeEditTarget}
+                            disableRemove={editForm.targets.length <= 1}
+                          />
+                        ))}
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          onClick={addEditTarget}
+                          className="h-10 w-full justify-center rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                        >
+                          <Plus className="mr-2 h-4 w-4" />
+                          {isZh ? "添加模型" : "Add model"}
+                        </Button>
+                      </div>
+                    </div>
                     <div className="col-span-2 space-y-2">
                       <FieldLabel>{isZh ? "访问控制（需 API Key）" : "Access Control (API Key required)"}</FieldLabel>
                       <div className="pt-1">
@@ -639,14 +690,7 @@ export default function RoutesPage() {
                       onClick={() =>
                         updateMut.mutate({
                           id: editForm.id,
-                          input: {
-                            name: editForm.name.trim(),
-                            ingress_protocol: editForm.ingress_protocol,
-                            virtual_model: editForm.virtual_model.trim(),
-                            target_provider: editForm.target_provider,
-                            target_model: editForm.target_model.trim(),
-                            access_control: editForm.access_control,
-                          },
+                          input: buildUpdatePayload(editForm),
                         })
                       }
                       disabled={updateMut.isPending}
@@ -677,6 +721,7 @@ export default function RoutesPage() {
                     <code className="rounded bg-slate-100 px-2 py-0.5 text-[11px] text-slate-600">
                       {protocolLabel(route.ingress_protocol)} / {route.virtual_model}
                     </code>
+                    <Badge variant="warning">{strategyLabel(route.strategy ?? "weighted", isZh)}</Badge>
                     {route.access_control && (
                       <Badge variant="warning">
                         {isZh ? "鉴权" : "Auth"}
@@ -701,6 +746,11 @@ export default function RoutesPage() {
                       <span className="text-slate-400">→</span>
                       <span className="font-medium text-slate-700">{route.target_model}</span>
                     </span>
+                    {route.targets && route.targets.length > 1 && (
+                      <Badge variant="success">
+                        {isZh ? `共 ${route.targets.length} 个目标` : `${route.targets.length} targets`}
+                      </Badge>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-0.5">
@@ -783,4 +833,45 @@ export default function RoutesPage() {
       />
     </div>
   );
+}
+
+function buildCreatePayload(form: RouteForm): CreateRoute {
+  const targets: CreateRouteTarget[] = form.targets.map((target) => ({
+    provider_id: target.provider_id,
+    model: target.model.trim(),
+    weight: target.weight,
+    priority: target.priority,
+  }));
+  const primary = targets[0] ?? { provider_id: "", model: "" };
+  return {
+    name: form.name.trim(),
+    ingress_protocol: form.ingress_protocol,
+    virtual_model: form.virtual_model.trim(),
+    strategy: form.strategy,
+    targets,
+    target_provider: primary.provider_id,
+    target_model: primary.model,
+    access_control: form.access_control,
+  };
+}
+
+function buildUpdatePayload(form: RouteForm & { id: string }): UpdateRoute {
+  const targets: UpsertRouteTarget[] = form.targets.map((target) => ({
+    id: target.id,
+    provider_id: target.provider_id,
+    model: target.model.trim(),
+    weight: target.weight,
+    priority: target.priority,
+  }));
+  const primary = targets[0] ?? { provider_id: "", model: "" };
+  return {
+    name: form.name.trim(),
+    ingress_protocol: form.ingress_protocol,
+    virtual_model: form.virtual_model.trim(),
+    strategy: form.strategy,
+    targets,
+    target_provider: primary.provider_id,
+    target_model: primary.model,
+    access_control: form.access_control,
+  };
 }

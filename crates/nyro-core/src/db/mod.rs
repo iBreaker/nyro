@@ -38,14 +38,17 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_provider_column(pool, "last_test_at", "TEXT").await?;
     ensure_route_column(pool, "ingress_protocol", "TEXT").await?;
     ensure_route_column(pool, "virtual_model", "TEXT").await?;
+    ensure_route_column(pool, "strategy", "TEXT DEFAULT 'weighted'").await?;
     ensure_route_column(pool, "access_control", "INTEGER DEFAULT 0").await?;
     ensure_request_log_column(pool, "api_key_id", "TEXT").await?;
     ensure_api_key_tables(pool).await?;
     ensure_api_key_column(pool, "rpd", "INTEGER").await?;
+    ensure_route_targets_table(pool).await?;
     backfill_provider_channel(pool).await?;
     backfill_provider_vendor(pool).await?;
     backfill_provider_models_source(pool).await?;
     backfill_route_fields(pool).await?;
+    backfill_route_targets(pool).await?;
     Ok(())
 }
 
@@ -183,6 +186,28 @@ async fn ensure_api_key_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_route_targets_table(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS route_targets (
+            id          TEXT PRIMARY KEY,
+            route_id    TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+            provider_id TEXT NOT NULL REFERENCES providers(id),
+            model       TEXT NOT NULL,
+            weight      INTEGER DEFAULT 100,
+            priority    INTEGER DEFAULT 1,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_route_targets_route_id ON route_targets(route_id)")
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 async fn backfill_route_fields(pool: &SqlitePool) -> anyhow::Result<()> {
     if column_exists(pool, "routes", "virtual_model").await?
         && column_exists(pool, "routes", "match_pattern").await?
@@ -201,6 +226,60 @@ async fn backfill_route_fields(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     }
+
+    if column_exists(pool, "routes", "strategy").await? {
+        sqlx::query(
+            "UPDATE routes SET strategy = 'weighted' WHERE strategy IS NULL OR trim(strategy) = ''",
+        )
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn backfill_route_targets(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority)
+        SELECT lower(hex(randomblob(16))), r.id, r.target_provider, r.target_model, 100, 1
+        FROM routes r
+        WHERE r.target_provider IS NOT NULL
+          AND trim(r.target_provider) != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id
+          )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority)
+        SELECT lower(hex(randomblob(16))), r.id, r.fallback_provider, COALESCE(NULLIF(r.fallback_model, ''), r.target_model), 100, 2
+        FROM routes r
+        WHERE r.fallback_provider IS NOT NULL
+          AND trim(r.fallback_provider) != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id AND rt.priority = 2
+          )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE routes
+        SET strategy = 'priority'
+        WHERE fallback_provider IS NOT NULL
+          AND trim(fallback_provider) != ''
+          AND (strategy IS NULL OR strategy = '' OR strategy = 'weighted')
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -242,6 +321,7 @@ CREATE TABLE IF NOT EXISTS routes (
     match_pattern     TEXT NOT NULL,
     ingress_protocol  TEXT,
     virtual_model     TEXT,
+    strategy          TEXT DEFAULT 'weighted',
     target_provider   TEXT NOT NULL REFERENCES providers(id),
     target_model      TEXT NOT NULL,
     fallback_provider TEXT REFERENCES providers(id),
@@ -251,6 +331,18 @@ CREATE TABLE IF NOT EXISTS routes (
     priority          INTEGER DEFAULT 0,
     created_at        TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS route_targets (
+    id          TEXT PRIMARY KEY,
+    route_id    TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL REFERENCES providers(id),
+    model       TEXT NOT NULL,
+    weight      INTEGER DEFAULT 100,
+    priority    INTEGER DEFAULT 1,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_targets_route_id ON route_targets(route_id);
 
 CREATE TABLE IF NOT EXISTS request_logs (
     id                TEXT PRIMARY KEY,

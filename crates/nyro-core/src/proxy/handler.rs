@@ -12,13 +12,14 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::db::models::{Provider, Route};
+use crate::db::models::{Provider, Route, RouteTarget};
 use crate::logging::LogEntry;
 use crate::protocol::gemini::decoder::GeminiDecoder;
 use crate::protocol::types::*;
 use crate::protocol::Protocol;
 use crate::proxy::adapter::{self, ProviderAdapter};
 use crate::proxy::client::ProxyClient;
+use crate::router::TargetSelector;
 use crate::storage::traits::{ApiKeyAccessRecord, UsageWindow};
 use crate::Gateway;
 
@@ -90,7 +91,7 @@ async fn universal_proxy(gw: Gateway, headers: HeaderMap, body: Value, ingress: 
 async fn proxy_pipeline(
     gw: Gateway,
     headers: HeaderMap,
-    mut internal: InternalRequest,
+    internal: InternalRequest,
     ingress: Protocol,
 ) -> Response {
     let start = Instant::now();
@@ -115,74 +116,109 @@ async fn proxy_pipeline(
         Err(resp) => return resp,
     };
 
-    let provider = match get_provider(&access_store, &route.target_provider).await {
-        Ok(p) => p,
-        Err(e) => return error_response(502, &format!("provider error: {e}")),
-    };
-
-    let actual_model = if route.target_model.is_empty() || route.target_model == "*" {
-        request_model.clone()
-    } else {
-        route.target_model.clone()
-    };
-
-    crate::protocol::semantic::tool_correlation::normalize_request_tool_results(&mut internal);
-
-    let egress: Protocol = provider.protocol.parse().unwrap_or(Protocol::OpenAI);
-    let adapter = adapter::get_adapter(&provider, egress);
-
-    adapter.pre_request(&mut internal, &actual_model, &gw, &provider).await;
-
-    let encoder = crate::protocol::get_encoder(egress);
-    let (egress_body, extra_headers) = match encoder.encode_request(&internal) {
-        Ok(r) => r,
-        Err(e) => return error_response(500, &format!("encode error: {e}")),
-    };
-
-    let egress_body = override_model(egress_body, &actual_model, egress);
-    let egress_path = encoder.egress_path(&actual_model, is_stream);
-    let client = ProxyClient::new(gw.http_client.clone());
-    let egress_str = egress.to_string();
-
-    if is_stream {
-        handle_stream(
-            gw,
-            client,
-            adapter.as_ref(),
-            &provider,
-            egress,
-            ingress,
-            &egress_path,
-            egress_body,
-            extra_headers,
-            &ingress_str,
-            &egress_str,
-            &request_model,
-            &actual_model,
-            auth_key.id.as_deref(),
-            start,
-        )
-        .await
-    } else {
-        handle_non_stream(
-            gw,
-            client,
-            adapter.as_ref(),
-            &provider,
-            egress,
-            ingress,
-            &egress_path,
-            egress_body,
-            extra_headers,
-            &ingress_str,
-            &egress_str,
-            &request_model,
-            &actual_model,
-            auth_key.id.as_deref(),
-            start,
-        )
-        .await
+    let targets = load_route_targets(&gw, &route).await;
+    if targets.is_empty() {
+        return error_response(503, "no route targets configured");
     }
+    let ordered_targets = TargetSelector::select_ordered(&route.strategy, &targets);
+    if ordered_targets.is_empty() {
+        return error_response(503, "no route targets configured");
+    }
+
+    let mut last_response: Option<Response> = None;
+    for target in ordered_targets {
+        let target_key = format!("{}:{}", target.provider_id, target.model);
+        if !gw.health_registry.is_healthy(&target_key) {
+            continue;
+        }
+        let provider = match get_provider(&access_store, &target.provider_id).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let actual_model = if target.model.is_empty() || target.model == "*" {
+            request_model.clone()
+        } else {
+            target.model.clone()
+        };
+
+        let mut internal_for_target = internal.clone();
+        crate::protocol::semantic::tool_correlation::normalize_request_tool_results(
+            &mut internal_for_target,
+        );
+
+        let egress: Protocol = provider.protocol.parse().unwrap_or(Protocol::OpenAI);
+        let adapter = adapter::get_adapter(&provider, egress);
+        adapter
+            .pre_request(&mut internal_for_target, &actual_model, &gw, &provider)
+            .await;
+
+        let encoder = crate::protocol::get_encoder(egress);
+        let (egress_body, extra_headers) = match encoder.encode_request(&internal_for_target) {
+            Ok(r) => r,
+            Err(e) => {
+                last_response = Some(error_response(500, &format!("encode error: {e}")));
+                continue;
+            }
+        };
+        let egress_body = override_model(egress_body, &actual_model, egress);
+        let egress_path = encoder.egress_path(&actual_model, is_stream);
+        let client = ProxyClient::new(gw.http_client.clone());
+        let egress_str = egress.to_string();
+
+        let response = if is_stream {
+            handle_stream(
+                gw.clone(),
+                client,
+                adapter.as_ref(),
+                &provider,
+                egress,
+                ingress,
+                &egress_path,
+                egress_body,
+                extra_headers,
+                &ingress_str,
+                &egress_str,
+                &request_model,
+                &actual_model,
+                auth_key.id.as_deref(),
+                start,
+            )
+            .await
+        } else {
+            handle_non_stream(
+                gw.clone(),
+                client,
+                adapter.as_ref(),
+                &provider,
+                egress,
+                ingress,
+                &egress_path,
+                egress_body,
+                extra_headers,
+                &ingress_str,
+                &egress_str,
+                &request_model,
+                &actual_model,
+                auth_key.id.as_deref(),
+                start,
+            )
+            .await
+        };
+
+        let status = response.status().as_u16();
+        if status < 400 {
+            gw.health_registry.record_success(&target_key);
+            return response;
+        }
+        gw.health_registry.record_failure(&target_key);
+        if is_retryable(status) {
+            last_response = Some(response);
+            continue;
+        }
+        return response;
+    }
+
+    last_response.unwrap_or_else(|| error_response(502, "all route targets failed"))
 }
 
 
@@ -607,6 +643,32 @@ fn error_response(status: u16, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn load_route_targets(gw: &Gateway, route: &Route) -> Vec<RouteTarget> {
+    if let Some(store) = gw.storage.route_targets() {
+        if let Ok(targets) = store.list_targets_by_route(&route.id).await {
+            if !targets.is_empty() {
+                return targets;
+            }
+        }
+    }
+    if route.target_provider.trim().is_empty() {
+        return vec![];
+    }
+    vec![RouteTarget {
+        id: String::new(),
+        route_id: route.id.clone(),
+        provider_id: route.target_provider.clone(),
+        model: route.target_model.clone(),
+        weight: 100,
+        priority: 1,
+        created_at: String::new(),
+    }]
+}
+
+fn is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 529)
 }
 
 fn emit_log(

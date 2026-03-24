@@ -1,6 +1,9 @@
+pub mod health;
 mod matcher;
+pub mod selector;
 
 pub use matcher::RouteCache;
+pub use selector::{SelectedTarget, TargetSelector};
 
 use crate::db::models::Route;
 

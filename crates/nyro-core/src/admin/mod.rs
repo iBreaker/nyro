@@ -431,7 +431,13 @@ impl AdminService {
     // ── Routes ──
 
     pub async fn list_routes(&self) -> anyhow::Result<Vec<Route>> {
-        self.gw.storage.routes().list().await
+        let mut routes = self.gw.storage.routes().list().await?;
+        if let Some(store) = self.gw.storage.route_targets() {
+            for route in &mut routes {
+                route.targets = store.list_targets_by_route(&route.id).await?;
+            }
+        }
+        Ok(routes)
     }
 
     pub async fn create_route(&self, input: CreateRoute) -> anyhow::Result<Route> {
@@ -441,6 +447,12 @@ impl AdminService {
         ensure_virtual_model(&input.virtual_model)?;
         self.ensure_route_unique(None, &input.ingress_protocol, &input.virtual_model)
             .await?;
+        let strategy = normalize_route_strategy(input.strategy.as_deref())?;
+        let targets = normalize_create_route_targets(&input)?;
+        ensure_route_targets_valid(&targets)?;
+        let primary_target = targets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("at least one route target is required"))?;
 
         let route = self
             .gw
@@ -450,24 +462,42 @@ impl AdminService {
                 name,
                 ingress_protocol: input.ingress_protocol,
                 virtual_model: input.virtual_model,
-                target_provider: input.target_provider,
-                target_model: input.target_model,
+                strategy: Some(strategy),
+                target_provider: primary_target.provider_id.clone(),
+                target_model: primary_target.model.clone(),
+                targets: vec![],
                 access_control: input.access_control,
             })
             .await?;
+        if let Some(store) = self.gw.storage.route_targets() {
+            store.set_targets(&route.id, &targets).await?;
+        }
         self.reload_route_cache().await?;
-        Ok(route)
+        self.get_route_by_id(&route.id).await
     }
 
     pub async fn update_route(&self, id: &str, input: UpdateRoute) -> anyhow::Result<Route> {
         let current = self.get_route_by_id(id).await?;
 
-        let name = normalize_name(&input.name.unwrap_or(current.name), "route name")?;
+        let name = normalize_name(
+            &input.name.clone().unwrap_or_else(|| current.name.clone()),
+            "route name",
+        )?;
         self.ensure_route_name_unique(Some(id), &name).await?;
-        let ingress_protocol = input.ingress_protocol.unwrap_or(current.ingress_protocol);
-        let virtual_model = input.virtual_model.unwrap_or(current.virtual_model);
-        let target_provider = input.target_provider.unwrap_or(current.target_provider);
-        let target_model = input.target_model.unwrap_or(current.target_model);
+        let ingress_protocol = input
+            .ingress_protocol
+            .clone()
+            .unwrap_or_else(|| current.ingress_protocol.clone());
+        let virtual_model = input
+            .virtual_model
+            .clone()
+            .unwrap_or_else(|| current.virtual_model.clone());
+        let strategy = normalize_route_strategy(input.strategy.as_deref().or(Some(&current.strategy)))?;
+        let targets = normalize_update_route_targets(&current, &input)?;
+        ensure_route_targets_valid(&targets)?;
+        let primary_target = targets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("at least one route target is required"))?;
         let access_control = input.access_control.unwrap_or(current.access_control);
         let is_active = input.is_active.unwrap_or(current.is_active);
         ensure_protocol(&ingress_protocol)?;
@@ -484,18 +514,26 @@ impl AdminService {
                     name: Some(name),
                     ingress_protocol: Some(ingress_protocol),
                     virtual_model: Some(virtual_model),
-                    target_provider: Some(target_provider),
-                    target_model: Some(target_model),
+                    strategy: Some(strategy),
+                    target_provider: Some(primary_target.provider_id.clone()),
+                    target_model: Some(primary_target.model.clone()),
+                    targets: None,
                     access_control: Some(access_control),
                     is_active: Some(is_active),
                 },
             )
             .await?;
+        if let Some(store) = self.gw.storage.route_targets() {
+            store.set_targets(id, &targets).await?;
+        }
         self.reload_route_cache().await?;
         self.get_route_by_id(id).await
     }
 
     pub async fn delete_route(&self, id: &str) -> anyhow::Result<()> {
+        if let Some(store) = self.gw.storage.route_targets() {
+            store.delete_targets_by_route(id).await?;
+        }
         self.gw.storage.routes().delete(id).await?;
         self.reload_route_cache().await?;
         Ok(())
@@ -734,8 +772,10 @@ impl AdminService {
                             name: r.name.clone(),
                             ingress_protocol: r.ingress_protocol.clone(),
                             virtual_model: r.virtual_model.clone(),
+                            strategy: Some("weighted".to_string()),
                             target_provider: pid,
                             target_model: r.target_model.clone(),
+                            targets: vec![],
                             access_control: Some(r.access_control),
                         })
                         .await
@@ -837,12 +877,17 @@ impl AdminService {
     }
 
     async fn get_route_by_id(&self, id: &str) -> anyhow::Result<Route> {
-        self.gw
+        let mut route = self
+            .gw
             .storage
             .routes()
             .get(id)
             .await?
-            .context("route not found")
+            .context("route not found")?;
+        if let Some(store) = self.gw.storage.route_targets() {
+            route.targets = store.list_targets_by_route(&route.id).await?;
+        }
+        Ok(route)
     }
 
     async fn reload_route_cache(&self) -> anyhow::Result<()> {
@@ -893,6 +938,88 @@ fn ensure_protocol(protocol: &str) -> anyhow::Result<()> {
 fn ensure_virtual_model(model: &str) -> anyhow::Result<()> {
     if model.trim().is_empty() {
         anyhow::bail!("virtual_model cannot be empty");
+    }
+    Ok(())
+}
+
+fn normalize_route_strategy(strategy: Option<&str>) -> anyhow::Result<String> {
+    let normalized = strategy
+        .unwrap_or("weighted")
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "weighted" | "priority" => Ok(normalized),
+        _ => anyhow::bail!("unsupported route strategy: {normalized}"),
+    }
+}
+
+fn normalize_create_route_targets(input: &CreateRoute) -> anyhow::Result<Vec<CreateRouteTarget>> {
+    if !input.targets.is_empty() {
+        return Ok(input.targets.clone());
+    }
+    if !input.target_provider.trim().is_empty() && !input.target_model.trim().is_empty() {
+        return Ok(vec![CreateRouteTarget {
+            provider_id: input.target_provider.clone(),
+            model: input.target_model.clone(),
+            weight: Some(100),
+            priority: Some(1),
+        }]);
+    }
+    anyhow::bail!("at least one route target is required")
+}
+
+fn normalize_update_route_targets(current: &Route, input: &UpdateRoute) -> anyhow::Result<Vec<CreateRouteTarget>> {
+    if let Some(targets) = &input.targets {
+        let mapped = targets
+            .iter()
+            .map(|target| CreateRouteTarget {
+                provider_id: target.provider_id.clone(),
+                model: target.model.clone(),
+                weight: target.weight,
+                priority: target.priority,
+            })
+            .collect();
+        return Ok(mapped);
+    }
+
+    let provider = input
+        .target_provider
+        .clone()
+        .unwrap_or_else(|| current.target_provider.clone());
+    let model = input
+        .target_model
+        .clone()
+        .unwrap_or_else(|| current.target_model.clone());
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        anyhow::bail!("route target cannot be empty");
+    }
+    Ok(vec![CreateRouteTarget {
+        provider_id: provider,
+        model,
+        weight: Some(100),
+        priority: Some(1),
+    }])
+}
+
+fn ensure_route_targets_valid(targets: &[CreateRouteTarget]) -> anyhow::Result<()> {
+    if targets.is_empty() {
+        anyhow::bail!("at least one route target is required");
+    }
+    for target in targets {
+        if target.provider_id.trim().is_empty() {
+            anyhow::bail!("target provider_id cannot be empty");
+        }
+        if target.model.trim().is_empty() {
+            anyhow::bail!("target model cannot be empty");
+        }
+        let weight = target.weight.unwrap_or(100);
+        if weight < 1 {
+            anyhow::bail!("target weight must be >= 1");
+        }
+        let priority = target.priority.unwrap_or(1);
+        if priority < 1 || priority > 2 {
+            anyhow::bail!("target priority must be 1 or 2");
+        }
     }
     Ok(())
 }

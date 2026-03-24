@@ -201,7 +201,7 @@ Open `http://localhost:19531` for the management UI.
 
 Default server behavior remains unchanged: if you do not pass storage-related options, Nyro continues to use local SQLite under `--data-dir`.
 
-For `postgres`, `mysql`, and `mongo`, the server binary also supports selecting a storage backend at startup. To avoid exposing credentials in process arguments, provide the DSN/URI through an environment variable and reference it via `--storage-dsn-env`.
+For `postgres` and `mysql`, the server binary also supports selecting a storage backend at startup. To avoid exposing credentials in process arguments, provide the DSN through an environment variable and reference it via `--storage-dsn-env`.
 
 ```bash
 # PostgreSQL
@@ -214,16 +214,11 @@ export NYRO_STORAGE_DSN='mysql://user:pass@host:3306/db'
 ./nyro-server-linux-x86_64 \
   --storage-backend mysql
 
-# MongoDB
-export NYRO_STORAGE_DSN='mongodb://user:pass@host:27017/admin?authSource=admin'
-./nyro-server-linux-x86_64 \
-  --storage-backend mongo \
-  --mongo-database nyro
 ```
 
 Additional storage-related server options:
 
-- `--storage-backend sqlite|postgres|mysql|mongo`
+- `--storage-backend sqlite|postgres|mysql`
 - `--storage-dsn-env` (defaults to `NYRO_STORAGE_DSN`)
 - `--sqlite-migrate-on-start true|false`
 - `--storage-max-connections`
@@ -231,8 +226,6 @@ Additional storage-related server options:
 - `--storage-acquire-timeout-secs`
 - `--storage-idle-timeout-secs`
 - `--storage-max-lifetime-secs`
-- `--mongo-database`
-- `--mongo-collection-*`
 
 ---
 

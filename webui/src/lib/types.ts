@@ -23,10 +23,24 @@ export interface Route {
   name: string;
   ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
+  strategy: RouteStrategy;
   target_provider: string;
   target_model: string;
   access_control: boolean;
   is_active: boolean;
+  created_at: string;
+  targets: RouteTarget[];
+}
+
+export type RouteStrategy = "weighted" | "priority";
+
+export interface RouteTarget {
+  id: string;
+  route_id: string;
+  provider_id: string;
+  model: string;
+  weight: number;
+  priority: number;
   created_at: string;
 }
 
@@ -184,8 +198,10 @@ export interface CreateRoute {
   name: string;
   ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
+  strategy?: RouteStrategy;
   target_provider: string;
   target_model: string;
+  targets?: CreateRouteTarget[];
   access_control?: boolean;
 }
 
@@ -193,10 +209,27 @@ export interface UpdateRoute {
   name?: string;
   ingress_protocol?: "openai" | "anthropic" | "gemini";
   virtual_model?: string;
+  strategy?: RouteStrategy;
   target_provider?: string;
   target_model?: string;
+  targets?: UpsertRouteTarget[];
   access_control?: boolean;
   is_active?: boolean;
+}
+
+export interface CreateRouteTarget {
+  provider_id: string;
+  model: string;
+  weight?: number;
+  priority?: number;
+}
+
+export interface UpsertRouteTarget {
+  id?: string;
+  provider_id: string;
+  model: string;
+  weight?: number;
+  priority?: number;
 }
 
 export interface CreateApiKey {

@@ -199,7 +199,7 @@ chmod +x nyro-server-linux-x86_64
 
 服务端默认行为保持不变：如果不传存储相关参数，Nyro 仍然使用 `--data-dir` 下的本地 SQLite。
 
-对于 `postgres`、`mysql`、`mongo`，服务端二进制也支持在启动时切换后端。为了避免把凭据暴露在进程参数中，建议通过环境变量提供 DSN/URI，再用 `--storage-dsn-env` 引用。
+对于 `postgres`、`mysql`，服务端二进制也支持在启动时切换后端。为了避免把凭据暴露在进程参数中，建议通过环境变量提供 DSN，再用 `--storage-dsn-env` 引用。
 
 ```bash
 # PostgreSQL
@@ -212,16 +212,11 @@ export NYRO_STORAGE_DSN='mysql://user:pass@host:3306/db'
 ./nyro-server-linux-x86_64 \
   --storage-backend mysql
 
-# MongoDB
-export NYRO_STORAGE_DSN='mongodb://user:pass@host:27017/admin?authSource=admin'
-./nyro-server-linux-x86_64 \
-  --storage-backend mongo \
-  --mongo-database nyro
 ```
 
 服务端新增的存储相关参数：
 
-- `--storage-backend sqlite|postgres|mysql|mongo`
+- `--storage-backend sqlite|postgres|mysql`
 - `--storage-dsn-env`，默认 `NYRO_STORAGE_DSN`
 - `--sqlite-migrate-on-start true|false`
 - `--storage-max-connections`
@@ -229,8 +224,6 @@ export NYRO_STORAGE_DSN='mongodb://user:pass@host:27017/admin?authSource=admin'
 - `--storage-acquire-timeout-secs`
 - `--storage-idle-timeout-secs`
 - `--storage-max-lifetime-secs`
-- `--mongo-database`
-- `--mongo-collection-*`
 
 ---
 

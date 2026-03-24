@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use sqlx::{MySql, Pool};
 
 use crate::db::models::{
-    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, LogPage, LogQuery,
-    ModelStats, Provider, ProviderStats, RequestLog, Route, StatsHourly, StatsOverview,
-    UpdateApiKey, UpdateProvider, UpdateRoute,
+    ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget,
+    LogPage, LogQuery, ModelStats, Provider, ProviderStats, RequestLog, Route, RouteTarget,
+    StatsHourly, StatsOverview, UpdateApiKey, UpdateProvider, UpdateRoute,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
@@ -15,8 +15,8 @@ use crate::storage::sql::dialect::SqlDialect;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, DynStorage, LogStore, ProviderStore,
-    ProviderTestResult, RouteSnapshotStore, RouteStore, SettingsStore, Storage, StorageBackend,
-    StorageBootstrap, StorageCapabilities, StorageHealth, UsageWindow,
+    ProviderTestResult, RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage,
+    StorageBackend, StorageBootstrap, StorageCapabilities, StorageHealth, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -73,6 +73,7 @@ impl MySqlAdapter {
 pub struct MySqlStorage {
     provider_store: Arc<MySqlProviderStore>,
     route_store: Arc<MySqlRouteStore>,
+    route_target_store: Arc<MySqlRouteTargetStore>,
     settings_store: Arc<MySqlSettingsStore>,
     api_key_store: Arc<MySqlApiKeyStore>,
     auth_store: Arc<MySqlAuthAccessStore>,
@@ -87,6 +88,9 @@ impl MySqlStorage {
             pool: adapter.pool().clone(),
         });
         let route_store = Arc::new(MySqlRouteStore {
+            pool: adapter.pool().clone(),
+        });
+        let route_target_store = Arc::new(MySqlRouteTargetStore {
             pool: adapter.pool().clone(),
         });
         let settings_store = Arc::new(MySqlSettingsStore {
@@ -105,6 +109,7 @@ impl MySqlStorage {
         Ok(Self {
             provider_store,
             route_store,
+            route_target_store,
             settings_store,
             api_key_store,
             auth_store,
@@ -129,6 +134,10 @@ impl Storage for MySqlStorage {
 
     fn settings(&self) -> &dyn SettingsStore {
         self.settings_store.as_ref()
+    }
+
+    fn route_targets(&self) -> Option<&dyn RouteTargetStore> {
+        Some(self.route_target_store.as_ref())
     }
 
     fn api_keys(&self) -> Option<&dyn ApiKeyStore> {
@@ -300,13 +309,14 @@ impl RouteStore for MySqlRouteStore {
         let ingress_protocol = input.ingress_protocol.trim().to_lowercase();
         let virtual_model = input.virtual_model.trim().to_string();
         sqlx::query(
-            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, target_provider, target_model, access_control, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())",
+            "INSERT INTO routes (id, name, ingress_protocol, virtual_model, match_pattern, strategy, target_provider, target_model, access_control, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())",
         )
         .bind(&id)
         .bind(input.name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(input.strategy.unwrap_or_else(|| "weighted".to_string()))
         .bind(input.target_provider.trim())
         .bind(input.target_model.trim())
         .bind(input.access_control.unwrap_or(false))
@@ -328,18 +338,20 @@ impl RouteStore for MySqlRouteStore {
             .unwrap_or(current.virtual_model)
             .trim()
             .to_string();
+        let strategy = input.strategy.unwrap_or(current.strategy);
         let target_provider = input.target_provider.unwrap_or(current.target_provider);
         let target_model = input.target_model.unwrap_or(current.target_model);
         let access_control = input.access_control.unwrap_or(current.access_control);
         let is_active = input.is_active.unwrap_or(current.is_active);
 
         sqlx::query(
-            "UPDATE routes SET name=?, ingress_protocol=?, virtual_model=?, match_pattern=?, target_provider=?, target_model=?, access_control=?, is_active=? WHERE id=?",
+            "UPDATE routes SET name=?, ingress_protocol=?, virtual_model=?, match_pattern=?, strategy=?, target_provider=?, target_model=?, access_control=?, is_active=? WHERE id=?",
         )
         .bind(name.trim())
         .bind(ingress_protocol)
         .bind(&virtual_model)
         .bind(&virtual_model)
+        .bind(strategy.trim().to_lowercase())
         .bind(target_provider.trim())
         .bind(target_model.trim())
         .bind(access_control)
@@ -419,6 +431,61 @@ impl RouteSnapshotStore for MySqlRouteStore {
         Ok(sqlx::query_as::<_, Route>(&sql)
             .fetch_all(&self.pool)
             .await?)
+    }
+}
+
+#[derive(Clone)]
+struct MySqlRouteTargetStore {
+    pool: Pool<MySql>,
+}
+
+#[async_trait]
+impl RouteTargetStore for MySqlRouteTargetStore {
+    async fn list_targets_by_route(&self, route_id: &str) -> anyhow::Result<Vec<RouteTarget>> {
+        Ok(sqlx::query_as::<_, RouteTarget>(
+            "SELECT id, route_id, provider_id, model, weight, priority, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at FROM route_targets WHERE route_id = ? ORDER BY priority ASC, created_at ASC",
+        )
+        .bind(route_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn set_targets(
+        &self,
+        route_id: &str,
+        targets: &[CreateRouteTarget],
+    ) -> anyhow::Result<Vec<RouteTarget>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
+            .bind(route_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for target in targets {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())",
+            )
+            .bind(id)
+            .bind(route_id)
+            .bind(target.provider_id.trim())
+            .bind(target.model.trim())
+            .bind(target.weight.unwrap_or(100).max(1))
+            .bind(target.priority.unwrap_or(1).max(1))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        self.list_targets_by_route(route_id).await
+    }
+
+    async fn delete_targets_by_route(&self, route_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
+            .bind(route_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -807,6 +874,43 @@ impl StorageBootstrap for MySqlBootstrap {
                 return Err(error.into());
             }
         }
+        let _ = sqlx::query("ALTER TABLE routes ADD COLUMN strategy VARCHAR(32) NULL")
+            .execute(self.adapter.pool())
+            .await;
+        sqlx::query("UPDATE routes SET strategy = 'weighted' WHERE strategy IS NULL OR TRIM(strategy) = ''")
+            .execute(self.adapter.pool())
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority, created_at)
+            SELECT LOWER(REPLACE(UUID(), '-', '')), r.id, r.target_provider, r.target_model, 100, 1, UTC_TIMESTAMP()
+            FROM routes r
+            WHERE r.target_provider IS NOT NULL
+              AND TRIM(r.target_provider) != ''
+              AND NOT EXISTS (SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id)
+            "#,
+        )
+        .execute(self.adapter.pool())
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority, created_at)
+            SELECT LOWER(REPLACE(UUID(), '-', '')), r.id, r.fallback_provider, COALESCE(NULLIF(r.fallback_model, ''), r.target_model), 100, 2, UTC_TIMESTAMP()
+            FROM routes r
+            WHERE r.fallback_provider IS NOT NULL
+              AND TRIM(r.fallback_provider) != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM route_targets rt WHERE rt.route_id = r.id AND rt.priority = 2
+              )
+            "#,
+        )
+        .execute(self.adapter.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE routes SET strategy = 'priority' WHERE fallback_provider IS NOT NULL AND TRIM(fallback_provider) != '' AND (strategy IS NULL OR strategy = '' OR strategy = 'weighted')",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         Ok(())
     }
 
@@ -845,7 +949,7 @@ fn provider_select(suffix: Option<&str>) -> String {
 
 fn route_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, target_provider, target_model, COALESCE(access_control, FALSE) AS access_control, is_active, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at FROM routes",
+        "SELECT id, name, COALESCE(ingress_protocol, 'openai') AS ingress_protocol, COALESCE(NULLIF(virtual_model, ''), match_pattern) AS virtual_model, COALESCE(strategy, 'weighted') AS strategy, target_provider, target_model, COALESCE(access_control, FALSE) AS access_control, is_active, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS created_at FROM routes",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -996,6 +1100,7 @@ CREATE TABLE IF NOT EXISTS routes (
     match_pattern VARCHAR(255) NOT NULL,
     ingress_protocol VARCHAR(64) NULL,
     virtual_model VARCHAR(255) NULL,
+    strategy VARCHAR(32) NULL,
     target_provider VARCHAR(64) NOT NULL,
     target_model VARCHAR(255) NOT NULL,
     fallback_provider VARCHAR(64) NULL,
@@ -1007,6 +1112,20 @@ CREATE TABLE IF NOT EXISTS routes (
     CONSTRAINT fk_routes_target_provider FOREIGN KEY (target_provider) REFERENCES providers(id),
     CONSTRAINT fk_routes_fallback_provider FOREIGN KEY (fallback_provider) REFERENCES providers(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS route_targets (
+    id VARCHAR(64) PRIMARY KEY,
+    route_id VARCHAR(64) NOT NULL,
+    provider_id VARCHAR(64) NOT NULL,
+    model VARCHAR(255) NOT NULL,
+    weight INT DEFAULT 100,
+    priority INT DEFAULT 1,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_route_targets_route FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE,
+    CONSTRAINT fk_route_targets_provider FOREIGN KEY (provider_id) REFERENCES providers(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE INDEX idx_route_targets_route_id ON route_targets(route_id);
 
 CREATE TABLE IF NOT EXISTS request_logs (
     id VARCHAR(64) PRIMARY KEY,
