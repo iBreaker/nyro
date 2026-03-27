@@ -5,6 +5,7 @@ export interface Provider {
   protocol: string;
   base_url: string;
   api_key?: string;
+  use_proxy: boolean;
   preset_key?: string | null;
   channel?: string | null;
   models_endpoint?: string | null;
@@ -170,6 +171,7 @@ export interface CreateProvider {
   vendor?: string;
   protocol: string;
   base_url: string;
+  use_proxy?: boolean;
   preset_key?: string;
   channel?: string;
   models_endpoint?: string;
@@ -184,6 +186,7 @@ export interface UpdateProvider {
   vendor?: string;
   protocol?: string;
   base_url?: string;
+  use_proxy?: boolean;
   preset_key?: string;
   channel?: string;
   models_endpoint?: string;
@@ -274,6 +277,7 @@ export interface ExportProvider {
   vendor?: string | null;
   protocol: string;
   base_url: string;
+  use_proxy: boolean;
   preset_key?: string | null;
   channel?: string | null;
   models_endpoint?: string | null;

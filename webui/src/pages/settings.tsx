@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, useRef } from "react";
 import { backend, IS_TAURI } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import type { GatewayStatus, ExportData, ImportResult } from "@/lib/types";
+import type { GatewayStatus, ExportData, ImportResult, Provider } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
 import {
   Download,
@@ -85,11 +85,26 @@ export default function SettingsPage() {
         backend("set_setting", { key: "proxy_url", value: proxyUrl.trim() }),
         backend("set_setting", { key: "proxy_bypass", value: proxyBypass.trim() }),
       ]);
+
+      // If global proxy is turned off, force all providers to disable provider-level proxy usage.
+      if (!proxyEnabled) {
+        const providers = await backend<Provider[]>("get_providers");
+        const providersUsingProxy = providers.filter((provider) => provider.use_proxy);
+        await Promise.all(
+          providersUsingProxy.map((provider) =>
+            backend("update_provider", {
+              id: provider.id,
+              input: { use_proxy: false },
+            }),
+          ),
+        );
+      }
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["setting", "proxy_enabled"] });
       qc.invalidateQueries({ queryKey: ["setting", "proxy_url"] });
       qc.invalidateQueries({ queryKey: ["setting", "proxy_bypass"] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
     },
     onError: (error: unknown) => {
       showErrorDialog("保存代理设置失败", "Failed to save proxy settings", error);

@@ -32,6 +32,7 @@ import { ProviderIcon } from "@/components/ui/provider-icon";
 import { NyroIcon } from "@/components/ui/nyro-icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -64,6 +65,7 @@ const emptyCreate: CreateProvider = {
   vendor: undefined,
   protocol: "openai",
   base_url: "https://api.openai.com",
+  use_proxy: false,
   preset_key: "",
   channel: "",
   models_endpoint: "",
@@ -321,10 +323,18 @@ export default function ProvidersPage() {
     queryKey: ["provider-presets"],
     queryFn: () => backend("get_provider_presets"),
   });
+  const { data: proxyEnabledSetting } = useQuery<string | null>({
+    queryKey: ["setting", "proxy_enabled"],
+    queryFn: () => backend("get_setting", { key: "proxy_enabled" }),
+  });
   const providerPresets = useMemo(
     () => (providerPresetsRaw.length ? providerPresetsRaw : [fallbackProviderPreset()]),
     [providerPresetsRaw],
   );
+  const isGlobalProxyEnabled = useMemo(() => {
+    const normalized = (proxyEnabledSetting ?? "").trim().toLowerCase();
+    return ["1", "true", "yes", "on"].includes(normalized);
+  }, [proxyEnabledSetting]);
 
   const [form, setForm] = useState<CreateProvider>(emptyCreate);
   const selectedPreset = useMemo(
@@ -342,6 +352,7 @@ export default function ProvidersPage() {
     vendor: undefined,
     protocol: "",
     base_url: "",
+    use_proxy: false,
     preset_key: "",
     channel: "",
     models_endpoint: "",
@@ -549,6 +560,7 @@ export default function ProvidersPage() {
       vendor: p.vendor ?? (p.preset_key || undefined),
       protocol: p.protocol,
       base_url: p.base_url,
+      use_proxy: p.use_proxy,
       preset_key: p.preset_key || DEFAULT_PRESET_ID,
       channel: p.channel || "default",
       models_endpoint: p.models_endpoint ?? "",
@@ -879,6 +891,26 @@ export default function ProvidersPage() {
                 />
               </div>
               <div className="space-y-2">
+                <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
+                <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                  <span className="text-xs text-slate-600">
+                    {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
+                  </span>
+                  <Switch
+                    checked={Boolean(form.use_proxy)}
+                    disabled={!isGlobalProxyEnabled}
+                    onCheckedChange={(checked) => setForm({ ...form, use_proxy: checked })}
+                  />
+                </div>
+                {!isGlobalProxyEnabled && (
+                  <p className="text-xs text-amber-600">
+                    {isZh
+                      ? "系统设置中的本地代理未启用，当前无法为 Provider 开启代理。"
+                      : "Local proxy is disabled in Settings, so provider proxy cannot be enabled."}
+                  </p>
+                )}
+              </div>
+              <div className="space-y-2">
                 <FieldLabel>API Key</FieldLabel>
                 <div className="relative">
                   <Input
@@ -1145,6 +1177,26 @@ export default function ProvidersPage() {
                       />
                     </div>
                     <div className="space-y-2">
+                      <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
+                      <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                        <span className="text-xs text-slate-600">
+                          {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
+                        </span>
+                        <Switch
+                          checked={Boolean(editForm.use_proxy)}
+                          disabled={!isGlobalProxyEnabled}
+                          onCheckedChange={(checked) => setEditForm({ ...editForm, use_proxy: checked })}
+                        />
+                      </div>
+                      {!isGlobalProxyEnabled && (
+                        <p className="text-xs text-amber-600">
+                          {isZh
+                            ? "系统设置中的本地代理未启用，当前无法为 Provider 开启代理。"
+                            : "Local proxy is disabled in Settings, so provider proxy cannot be enabled."}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
                       <FieldLabel>{isZh ? "API Key" : "API Key"}</FieldLabel>
                       <div className="relative">
                         <Input
@@ -1206,6 +1258,7 @@ export default function ProvidersPage() {
                           vendor: editForm.vendor || undefined,
                           protocol: editForm.protocol || undefined,
                           base_url: editForm.base_url || undefined,
+                          use_proxy: Boolean(editForm.use_proxy),
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_endpoint: editForm.models_endpoint || undefined,
