@@ -225,6 +225,57 @@ export NYRO_STORAGE_DSN='mysql://user:pass@host:3306/db'
 - `--storage-idle-timeout-secs`
 - `--storage-max-lifetime-secs`
 
+### Docker
+
+Nyro 的 Docker 方案拆成两类用途：
+
+- `docker/runtime/Dockerfile`：面向分发的服务端镜像（`nyro-server` + `webui/dist`）
+- `docker/dev/Dockerfile`：面向贡献者的开发容器
+
+构建并运行服务端分发镜像：
+
+```bash
+docker build -f docker/runtime/Dockerfile -t nyro:runtime .
+
+docker run --rm \
+  -e NYRO_ADMIN_KEY=change-me \
+  -p 19530:19530 \
+  -p 19531:19531 \
+  -v nyro-data:/var/lib/nyro \
+  nyro:runtime
+```
+
+打开 `http://127.0.0.1:19531` 进入管理界面。
+
+管理 API 请求时，请使用同一个 `NYRO_ADMIN_KEY` 作为 Bearer Token。
+
+如果你需要改用其他镜像仓库，或使用自定义基础镜像，可以通过 `--build-arg` 覆盖：
+
+```bash
+docker build \
+  --build-arg RUST_IMAGE=<custom-rust-image> \
+  --build-arg NODE_IMAGE=<custom-node-image> \
+  --build-arg RUNTIME_IMAGE=<custom-runtime-image> \
+  -f docker/runtime/Dockerfile \
+  -t nyro:runtime .
+```
+
+直接使用开发容器：
+
+```bash
+docker build -f docker/dev/Dockerfile -t nyro:dev .
+
+docker run --rm -it \
+  -v "$(pwd)":/workspace/nyro \
+  -w /workspace/nyro \
+  -p 5173:5173 \
+  -p 19530:19530 \
+  -p 19531:19531 \
+  nyro:dev
+```
+
+使用 VS Code / Cursor 时，也可以直接打开 `.devcontainer/devcontainer.json`。
+
 ---
 
 ## 快速开始
