@@ -1,14 +1,14 @@
-pub mod types;
-pub mod openai;
 pub mod anthropic;
 pub mod gemini;
+pub mod openai;
 pub mod semantic;
+pub mod types;
 
 use std::collections::HashMap;
 
 use reqwest::header::HeaderMap;
 
-use crate::db::models::{Provider, ProtocolEndpointEntry};
+use crate::db::models::{ProtocolEndpointEntry, Provider};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,10 +79,7 @@ pub trait EgressEncoder {
 // ── Provider response → internal ──
 
 pub trait ResponseParser: Send {
-    fn parse_response(
-        &self,
-        resp: serde_json::Value,
-    ) -> anyhow::Result<types::InternalResponse>;
+    fn parse_response(&self, resp: serde_json::Value) -> anyhow::Result<types::InternalResponse>;
 }
 
 // ── Internal → client response ──
@@ -153,9 +150,10 @@ pub fn get_encoder(protocol: Protocol) -> Box<dyn EgressEncoder + Send> {
 
 pub fn get_response_parser(protocol: Protocol) -> Box<dyn ResponseParser> {
     match protocol {
-        Protocol::OpenAI | Protocol::ResponsesAPI => Box::new(openai::stream::OpenAIResponseParser),
+        Protocol::OpenAI => Box::new(openai::stream::OpenAIResponseParser),
         Protocol::Anthropic => Box::new(anthropic::stream::AnthropicResponseParser),
         Protocol::Gemini => Box::new(gemini::stream::GeminiResponseParser),
+        Protocol::ResponsesAPI => Box::new(openai::responses::parser::ResponsesResponseParser),
     }
 }
 
@@ -172,11 +170,10 @@ pub fn get_response_formatter(protocol: Protocol) -> Box<dyn ResponseFormatter> 
 
 pub fn get_stream_parser(protocol: Protocol) -> Box<dyn StreamParser> {
     match protocol {
-        Protocol::OpenAI | Protocol::ResponsesAPI => {
-            Box::new(openai::stream::OpenAIStreamParser::new())
-        }
+        Protocol::OpenAI => Box::new(openai::stream::OpenAIStreamParser::new()),
         Protocol::Anthropic => Box::new(anthropic::stream::AnthropicStreamParser::new()),
         Protocol::Gemini => Box::new(gemini::stream::GeminiStreamParser::new()),
+        Protocol::ResponsesAPI => Box::new(openai::responses::parser::ResponsesStreamParser::new()),
     }
 }
 
@@ -219,13 +216,7 @@ impl ProviderProtocols {
         let default = provider
             .effective_default_protocol()
             .parse::<Protocol>()
-            .unwrap_or_else(|_| {
-                endpoints
-                    .keys()
-                    .next()
-                    .copied()
-                    .unwrap_or(Protocol::OpenAI)
-            });
+            .unwrap_or_else(|_| endpoints.keys().next().copied().unwrap_or(Protocol::OpenAI));
 
         Self { default, endpoints }
     }
