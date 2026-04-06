@@ -16,8 +16,14 @@ const OLLAMA_CAPABILITY_CACHE_TTL_SECS: u64 = 3600;
 
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
-    fn auth_headers(&self, api_key: &str) -> HeaderMap;
-    fn build_url(&self, base_url: &str, path: &str, api_key: &str) -> String;
+    fn auth_headers(&self, api_key: &str, disable_default_auth: bool) -> HeaderMap;
+    fn build_url(
+        &self,
+        base_url: &str,
+        path: &str,
+        api_key: &str,
+        disable_default_auth: bool,
+    ) -> String;
 
     async fn pre_request(
         &self,
@@ -35,8 +41,11 @@ pub struct OpenAICompatAdapter;
 
 #[async_trait]
 impl ProviderAdapter for OpenAICompatAdapter {
-    fn auth_headers(&self, api_key: &str) -> HeaderMap {
+    fn auth_headers(&self, api_key: &str, disable_default_auth: bool) -> HeaderMap {
         let mut h = HeaderMap::new();
+        if disable_default_auth {
+            return h;
+        }
         let val = format!("Bearer {api_key}");
         if let Ok(v) = HeaderValue::from_str(&val) {
             h.insert("Authorization", v);
@@ -44,7 +53,13 @@ impl ProviderAdapter for OpenAICompatAdapter {
         h
     }
 
-    fn build_url(&self, base_url: &str, path: &str, _api_key: &str) -> String {
+    fn build_url(
+        &self,
+        base_url: &str,
+        path: &str,
+        _api_key: &str,
+        _disable_default_auth: bool,
+    ) -> String {
         let base = base_url.trim_end_matches('/');
         let adjusted = if has_non_root_path(base) && path.starts_with("/v1/") {
             &path[3..]
@@ -61,20 +76,26 @@ pub struct AnthropicAdapter;
 
 #[async_trait]
 impl ProviderAdapter for AnthropicAdapter {
-    fn auth_headers(&self, api_key: &str) -> HeaderMap {
+    fn auth_headers(&self, api_key: &str, disable_default_auth: bool) -> HeaderMap {
         let mut h = HeaderMap::new();
+        if disable_default_auth {
+            return h;
+        }
         h.insert(
             "x-api-key",
             HeaderValue::from_str(api_key).unwrap_or_else(|_| HeaderValue::from_static("")),
         );
-        h.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
+        h.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         h
     }
 
-    fn build_url(&self, base_url: &str, path: &str, _api_key: &str) -> String {
+    fn build_url(
+        &self,
+        base_url: &str,
+        path: &str,
+        _api_key: &str,
+        _disable_default_auth: bool,
+    ) -> String {
         format!("{}{path}", base_url.trim_end_matches('/'))
     }
 }
@@ -85,12 +106,21 @@ pub struct GeminiAdapter;
 
 #[async_trait]
 impl ProviderAdapter for GeminiAdapter {
-    fn auth_headers(&self, _api_key: &str) -> HeaderMap {
+    fn auth_headers(&self, _api_key: &str, _disable_default_auth: bool) -> HeaderMap {
         HeaderMap::new()
     }
 
-    fn build_url(&self, base_url: &str, path: &str, api_key: &str) -> String {
+    fn build_url(
+        &self,
+        base_url: &str,
+        path: &str,
+        api_key: &str,
+        disable_default_auth: bool,
+    ) -> String {
         let url = format!("{}{path}", base_url.trim_end_matches('/'));
+        if disable_default_auth {
+            return url;
+        }
         if url.contains('?') {
             format!("{url}&key={api_key}")
         } else {
@@ -105,12 +135,18 @@ pub struct OllamaAdapter;
 
 #[async_trait]
 impl ProviderAdapter for OllamaAdapter {
-    fn auth_headers(&self, api_key: &str) -> HeaderMap {
-        OpenAICompatAdapter.auth_headers(api_key)
+    fn auth_headers(&self, api_key: &str, disable_default_auth: bool) -> HeaderMap {
+        OpenAICompatAdapter.auth_headers(api_key, disable_default_auth)
     }
 
-    fn build_url(&self, base_url: &str, path: &str, api_key: &str) -> String {
-        OpenAICompatAdapter.build_url(base_url, path, api_key)
+    fn build_url(
+        &self,
+        base_url: &str,
+        path: &str,
+        api_key: &str,
+        disable_default_auth: bool,
+    ) -> String {
+        OpenAICompatAdapter.build_url(base_url, path, api_key, disable_default_auth)
     }
 
     async fn pre_request(

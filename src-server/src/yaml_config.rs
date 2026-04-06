@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub struct YamlConfig {
@@ -105,7 +105,10 @@ impl YamlConfig {
                 anyhow::bail!("providers[{i}]: name is required");
             }
             if p.endpoints.is_empty() {
-                anyhow::bail!("providers[{i}] ({}): at least one endpoint is required", p.name);
+                anyhow::bail!(
+                    "providers[{i}] ({}): at least one endpoint is required",
+                    p.name
+                );
             }
             if !p.endpoints.contains_key(&p.default_protocol) {
                 anyhow::bail!(

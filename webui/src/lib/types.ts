@@ -8,6 +8,17 @@ export interface Provider {
   protocol_endpoints: string;
   api_key?: string;
   use_proxy: boolean;
+  auth_mode?: "apikey" | "oauth";
+  oauth_status?:
+    | "not_connected"
+    | "pending"
+    | "connected"
+    | "unavailable"
+    | "quota_exhausted";
+  oauth_expires_at?: string | null;
+  oauth_resource_url?: string | null;
+  oauth_last_error?: string | null;
+  oauth_updated_at?: string | null;
   preset_key?: string | null;
   channel?: string | null;
   models_source?: string | null;
@@ -158,6 +169,7 @@ export interface ProviderPreset {
   };
   icon?: string;
   defaultProtocol: ProviderProtocol;
+  authMode?: "apikey" | "oauth";
   channels?: ProviderChannelPreset[];
 }
 
@@ -169,6 +181,8 @@ export interface CreateProvider {
   default_protocol?: string;
   protocol_endpoints?: string;
   use_proxy?: boolean;
+  auth_mode?: "apikey" | "oauth";
+  oauth_resource_url?: string;
   preset_key?: string;
   channel?: string;
   models_source?: string;
@@ -185,6 +199,8 @@ export interface UpdateProvider {
   default_protocol?: string;
   protocol_endpoints?: string;
   use_proxy?: boolean;
+  auth_mode?: "apikey" | "oauth";
+  oauth_resource_url?: string;
   preset_key?: string;
   channel?: string;
   models_source?: string;
@@ -296,3 +312,67 @@ export interface ImportResult {
   routes_imported: number;
   settings_imported: number;
 }
+
+export interface OAuthInitData {
+  provider_id: string;
+  vendor: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete: string;
+  expires_in: number;
+  interval: number;
+}
+
+export interface OAuthSessionInitData {
+  session_id: string;
+  vendor: string;
+  scheme: string;
+  auth_url: string;
+  requires_manual_code: boolean;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete: string;
+  expires_in: number;
+  interval: number;
+}
+
+export type OAuthSessionStatusData =
+  | {
+      status: "pending";
+      scheme: string;
+      auth_url: string;
+      requires_manual_code: boolean;
+      expires_in: number;
+      interval: number;
+      user_code: string;
+      verification_uri_complete: string;
+    }
+  | {
+      status: "ready";
+      expires_in: number;
+      resource_url?: string | null;
+    }
+  | {
+      status: "error";
+      code: string;
+      message: string;
+    };
+
+export type OAuthStatusData =
+  | {
+      status: "pending";
+      expires_in: number;
+      interval: number;
+      user_code: string;
+      verification_uri_complete: string;
+    }
+  | {
+      status: "connected";
+      expires_in: number;
+      resource_url?: string | null;
+    }
+  | {
+      status: "error";
+      code: string;
+      message: string;
+    };

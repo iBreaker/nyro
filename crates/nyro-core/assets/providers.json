@@ -28,10 +28,57 @@
     ]
   },
   {
+    "id": "codex",
+    "label": { "zh": "Codex", "en": "Codex" },
+    "icon": "openai",
+    "defaultProtocol": "openai",
+    "authMode": "oauth",
+    "channels": [
+      {
+        "id": "default",
+        "label": { "zh": "默认", "en": "Default" },
+        "baseUrls": { "openai": "https://chatgpt.com/backend-api/codex" },
+        "capabilitiesSource": "ai://models.dev/openai"
+      }
+    ]
+  },
+  {
     "id": "anthropic",
     "label": { "zh": "Anthropic", "en": "Anthropic" },
     "icon": "anthropic",
     "defaultProtocol": "anthropic",
+    "channels": [
+      {
+        "id": "default",
+        "label": { "zh": "默认", "en": "Default" },
+        "baseUrls": { "anthropic": "https://api.anthropic.com" },
+        "modelsSource": "https://api.anthropic.com/v1/models",
+        "capabilitiesSource": "ai://models.dev/anthropic"
+      }
+    ]
+  },
+  {
+    "id": "claude",
+    "label": { "zh": "Claude", "en": "Claude" },
+    "icon": "anthropic",
+    "defaultProtocol": "anthropic",
+    "authMode": "oauth",
+    "channels": [
+      {
+        "id": "default",
+        "label": { "zh": "默认", "en": "Default" },
+        "baseUrls": { "anthropic": "https://api.anthropic.com" },
+        "modelsSource": "https://api.anthropic.com/v1/models",
+        "capabilitiesSource": "ai://models.dev/anthropic"
+      }
+    ]
+  },
+  {
+    "id": "claude-setup-token",
+    "label": { "zh": "Claude Setup Token", "en": "Claude Setup Token" },
+    "icon": "anthropic",
+    "defaultProtocol": "anthropic",
+    "authMode": "oauth",
     "channels": [
       {
         "id": "default",
@@ -57,6 +104,38 @@
         },
         "modelsSource": "https://generativelanguage.googleapis.com/v1beta/openai/models",
         "capabilitiesSource": "ai://models.dev/google"
+      }
+    ]
+  },
+  {
+    "id": "cloud-code",
+    "label": { "zh": "Cloud Code", "en": "Cloud Code" },
+    "icon": "google",
+    "defaultProtocol": "gemini",
+    "authMode": "oauth",
+    "channels": [
+      {
+        "id": "default",
+        "label": { "zh": "默认", "en": "Default" },
+        "baseUrls": { "gemini": "https://cloudcode-pa.googleapis.com/v1internal" },
+        "capabilitiesSource": "ai://models.dev/google",
+        "staticModels": ["gemini-2.5-pro", "gemini-2.5-flash"]
+      }
+    ]
+  },
+  {
+    "id": "qwen-code-cli",
+    "label": { "zh": "Qwen Code", "en": "Qwen Code" },
+    "icon": "qwen",
+    "defaultProtocol": "openai",
+    "authMode": "oauth",
+    "channels": [
+      {
+        "id": "default",
+        "label": { "zh": "默认", "en": "Default" },
+        "baseUrls": { "openai": "https://portal.qwen.ai/v1" },
+        "modelsSource": "https://chat.qwen.ai/api/models",
+        "capabilitiesSource": "ai://models.dev/alibaba"
       }
     ]
   },

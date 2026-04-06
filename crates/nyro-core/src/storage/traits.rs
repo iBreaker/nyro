@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::auth::types::{
+    AuthSession, CreateAuthSession, ProviderAuthBinding, UpdateAuthSession,
+    UpsertProviderAuthBinding,
+};
 use crate::db::models::{
     ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget, LogPage,
     LogQuery, ModelStats, Provider, ProviderStats, Route, RouteTarget, StatsHourly, StatsOverview,
@@ -55,7 +59,11 @@ pub trait ProviderStore: Send + Sync {
     async fn update(&self, id: &str, input: UpdateProvider) -> anyhow::Result<Provider>;
     async fn delete(&self, id: &str) -> anyhow::Result<()>;
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool>;
-    async fn record_test_result(&self, provider_id: &str, result: ProviderTestResult) -> anyhow::Result<()>;
+    async fn record_test_result(
+        &self,
+        provider_id: &str,
+        result: ProviderTestResult,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -107,11 +115,44 @@ pub trait ApiKeyStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait AuthSessionStore: Send + Sync {
+    async fn list(&self) -> anyhow::Result<Vec<AuthSession>>;
+    async fn get(&self, id: &str) -> anyhow::Result<Option<AuthSession>>;
+    async fn create(&self, input: CreateAuthSession) -> anyhow::Result<AuthSession>;
+    async fn update(&self, id: &str, input: UpdateAuthSession) -> anyhow::Result<AuthSession>;
+    async fn delete(&self, id: &str) -> anyhow::Result<()>;
+    async fn delete_expired(&self) -> anyhow::Result<u64>;
+}
+
+#[async_trait]
+pub trait ProviderAuthBindingStore: Send + Sync {
+    async fn list_by_provider(&self, provider_id: &str)
+    -> anyhow::Result<Vec<ProviderAuthBinding>>;
+    async fn get_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<Option<ProviderAuthBinding>>;
+    async fn upsert(&self, input: UpsertProviderAuthBinding)
+    -> anyhow::Result<ProviderAuthBinding>;
+    async fn delete_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
 pub trait AuthAccessStore: Send + Sync {
     async fn find_api_key(&self, raw_key: &str) -> anyhow::Result<Option<ApiKeyAccessRecord>>;
     async fn route_binding_exists(&self, api_key_id: &str, route_id: &str) -> anyhow::Result<bool>;
-    async fn request_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64>;
-    async fn token_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64>;
+    async fn request_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64>;
+    async fn token_count_since(&self, api_key_id: &str, window: UsageWindow)
+    -> anyhow::Result<i64>;
 }
 
 #[async_trait]
@@ -141,6 +182,12 @@ pub trait Storage: Send + Sync {
     }
     fn settings(&self) -> &dyn SettingsStore;
     fn api_keys(&self) -> Option<&dyn ApiKeyStore> {
+        None
+    }
+    fn auth_sessions(&self) -> Option<&dyn AuthSessionStore> {
+        None
+    }
+    fn provider_auth_bindings(&self) -> Option<&dyn ProviderAuthBindingStore> {
         None
     }
     fn auth(&self) -> Option<&dyn AuthAccessStore> {

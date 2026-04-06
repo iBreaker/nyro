@@ -4,6 +4,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use sqlx::{Pool, Postgres};
 
+use crate::auth::types::{
+    AuthSession, CreateAuthSession, ProviderAuthBinding, UpdateAuthSession,
+    UpsertProviderAuthBinding,
+};
 use crate::db::models::{
     ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget,
     LogPage, LogQuery, ModelStats, Provider, ProviderStats, RequestLog, Route, RouteTarget,
@@ -13,9 +17,10 @@ use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, DynStorage, LogStore, ProviderStore,
-    ProviderTestResult, RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage,
-    StorageBackend, StorageBootstrap, StorageHealth, UsageWindow,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, AuthSessionStore, DynStorage, LogStore,
+    ProviderAuthBindingStore, ProviderStore, ProviderTestResult, RouteSnapshotStore, RouteStore,
+    RouteTargetStore, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
+    UsageWindow,
 };
 
 #[derive(Clone)]
@@ -32,9 +37,12 @@ pub struct PostgresHealth {
 
 impl PostgresAdapter {
     pub async fn connect(config: SqlBackendConfig) -> anyhow::Result<Self> {
-        let pool = RelationalPool::connect(crate::storage::sql::config::SqlBackendKind::Postgres, &config)
-            .await
-            .context("connect postgres adapter")?;
+        let pool = RelationalPool::connect(
+            crate::storage::sql::config::SqlBackendKind::Postgres,
+            &config,
+        )
+        .await
+        .context("connect postgres adapter")?;
         let pool = pool
             .as_postgres()
             .cloned()
@@ -71,6 +79,8 @@ pub struct PostgresStorage {
     route_target_store: Arc<PostgresRouteTargetStore>,
     settings_store: Arc<PostgresSettingsStore>,
     api_key_store: Arc<PostgresApiKeyStore>,
+    auth_session_store: Arc<PostgresAuthSessionStore>,
+    provider_auth_binding_store: Arc<PostgresProviderAuthBindingStore>,
     auth_store: Arc<PostgresAuthAccessStore>,
     log_store: Arc<PostgresLogStore>,
     bootstrap: Arc<PostgresBootstrap>,
@@ -94,6 +104,12 @@ impl PostgresStorage {
         let api_key_store = Arc::new(PostgresApiKeyStore {
             pool: adapter.pool().clone(),
         });
+        let auth_session_store = Arc::new(PostgresAuthSessionStore {
+            pool: adapter.pool().clone(),
+        });
+        let provider_auth_binding_store = Arc::new(PostgresProviderAuthBindingStore {
+            pool: adapter.pool().clone(),
+        });
         let auth_store = Arc::new(PostgresAuthAccessStore {
             pool: adapter.pool().clone(),
         });
@@ -107,6 +123,8 @@ impl PostgresStorage {
             route_target_store,
             settings_store,
             api_key_store,
+            auth_session_store,
+            provider_auth_binding_store,
             auth_store,
             log_store,
             bootstrap,
@@ -139,6 +157,14 @@ impl Storage for PostgresStorage {
         Some(self.api_key_store.as_ref())
     }
 
+    fn auth_sessions(&self) -> Option<&dyn AuthSessionStore> {
+        Some(self.auth_session_store.as_ref())
+    }
+
+    fn provider_auth_bindings(&self) -> Option<&dyn ProviderAuthBindingStore> {
+        Some(self.provider_auth_binding_store.as_ref())
+    }
+
     fn auth(&self) -> Option<&dyn AuthAccessStore> {
         Some(self.auth_store.as_ref())
     }
@@ -157,6 +183,16 @@ struct PostgresProviderStore {
     pool: Pool<Postgres>,
 }
 
+#[derive(Clone)]
+struct PostgresAuthSessionStore {
+    pool: Pool<Postgres>,
+}
+
+#[derive(Clone)]
+struct PostgresProviderAuthBindingStore {
+    pool: Pool<Postgres>,
+}
+
 #[async_trait]
 impl ProviderStore for PostgresProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
@@ -166,10 +202,12 @@ impl ProviderStore for PostgresProviderStore {
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
-        Ok(sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = $1")))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = $1")))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     async fn create(&self, input: CreateProvider) -> anyhow::Result<Provider> {
@@ -200,11 +238,16 @@ impl ProviderStore for PostgresProviderStore {
         .bind(input.use_proxy)
         .execute(&self.pool)
         .await?;
-        self.get(&id).await?.context("provider missing after create")
+        self.get(&id)
+            .await?
+            .context("provider missing after create")
     }
 
     async fn update(&self, id: &str, input: UpdateProvider) -> anyhow::Result<Provider> {
-        let current = self.get(id).await?.context("provider not found for update")?;
+        let current = self
+            .get(id)
+            .await?
+            .context("provider not found for update")?;
         let models_source_input = input.effective_models_source().map(ToString::to_string);
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -212,13 +255,10 @@ impl ProviderStore for PostgresProviderStore {
         } else {
             normalize_provider_vendor(current.vendor.as_deref())
         };
-        let models_source = models_source_input
-            .or_else(|| current.models_source.clone());
+        let models_source = models_source_input.or_else(|| current.models_source.clone());
         let protocol = input.protocol.unwrap_or(current.protocol.clone());
         let base_url = input.base_url.unwrap_or(current.base_url);
-        let default_protocol = input
-            .default_protocol
-            .unwrap_or(current.default_protocol);
+        let default_protocol = input.default_protocol.unwrap_or(current.default_protocol);
         let protocol_endpoints = input
             .protocol_endpoints
             .unwrap_or(current.protocol_endpoints);
@@ -281,13 +321,190 @@ impl ProviderStore for PostgresProviderStore {
         Ok(row.is_some())
     }
 
-    async fn record_test_result(&self, provider_id: &str, result: ProviderTestResult) -> anyhow::Result<()> {
+    async fn record_test_result(
+        &self,
+        provider_id: &str,
+        result: ProviderTestResult,
+    ) -> anyhow::Result<()> {
         let _ = result.tested_at;
         sqlx::query(
             "UPDATE providers SET last_test_success = $1, last_test_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(result.success)
         .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AuthSessionStore for PostgresAuthSessionStore {
+    async fn list(&self) -> anyhow::Result<Vec<AuthSession>> {
+        Ok(sqlx::query_as::<_, AuthSession>(&auth_session_select(None))
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn get(&self, id: &str) -> anyhow::Result<Option<AuthSession>> {
+        Ok(
+            sqlx::query_as::<_, AuthSession>(&auth_session_select(Some("WHERE id = $1")))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn create(&self, input: CreateAuthSession) -> anyhow::Result<AuthSession> {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO auth_sessions (id, provider_id, driver_key, scheme, status, use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, expires_at, poll_interval_seconds, last_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+        )
+        .bind(&id)
+        .bind(input.provider_id)
+        .bind(input.driver_key)
+        .bind(input.scheme)
+        .bind(input.status)
+        .bind(input.use_proxy)
+        .bind(input.user_code)
+        .bind(input.verification_uri)
+        .bind(input.verification_uri_complete)
+        .bind(input.state_json)
+        .bind(input.context_json)
+        .bind(input.result_json)
+        .bind(input.expires_at)
+        .bind(input.poll_interval_seconds)
+        .bind(input.last_error)
+        .execute(&self.pool)
+        .await?;
+        self.get(&id)
+            .await?
+            .context("auth session missing after create")
+    }
+
+    async fn update(&self, id: &str, input: UpdateAuthSession) -> anyhow::Result<AuthSession> {
+        let current = self
+            .get(id)
+            .await?
+            .context("auth session not found for update")?;
+        sqlx::query(
+            "UPDATE auth_sessions SET status=$1, user_code=$2, verification_uri=$3, verification_uri_complete=$4, state_json=$5, context_json=$6, result_json=$7, expires_at=$8, poll_interval_seconds=$9, last_error=$10, updated_at=CURRENT_TIMESTAMP WHERE id=$11",
+        )
+        .bind(input.status.unwrap_or(current.status))
+        .bind(input.user_code.or(current.user_code))
+        .bind(input.verification_uri.or(current.verification_uri))
+        .bind(input.verification_uri_complete.or(current.verification_uri_complete))
+        .bind(input.state_json.or(current.state_json))
+        .bind(input.context_json.or(current.context_json))
+        .bind(input.result_json.or(current.result_json))
+        .bind(input.expires_at.or(current.expires_at))
+        .bind(input.poll_interval_seconds.or(current.poll_interval_seconds))
+        .bind(input.last_error.or(current.last_error))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get(id)
+            .await?
+            .context("auth session missing after update")
+    }
+
+    async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM auth_sessions WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM auth_sessions WHERE expires_at IS NOT NULL AND trim(expires_at) != '' AND expires_at::timestamptz <= CURRENT_TIMESTAMP",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[async_trait]
+impl ProviderAuthBindingStore for PostgresProviderAuthBindingStore {
+    async fn list_by_provider(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = $1",
+            )))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn get_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<Option<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = $1 AND driver_key = $2",
+            )))
+            .bind(provider_id)
+            .bind(driver_key)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn upsert(
+        &self,
+        input: UpsertProviderAuthBinding,
+    ) -> anyhow::Result<ProviderAuthBinding> {
+        let id = if let Some(existing) = self
+            .get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+        {
+            existing.id
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+
+        sqlx::query(
+            "INSERT INTO provider_auth_bindings (id, provider_id, driver_key, scheme, status, access_token, refresh_token, expires_at, resource_url, subject_id, scopes_json, meta_json, last_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (provider_id, driver_key) DO UPDATE SET scheme=EXCLUDED.scheme, status=EXCLUDED.status, access_token=EXCLUDED.access_token, refresh_token=EXCLUDED.refresh_token, expires_at=EXCLUDED.expires_at, resource_url=EXCLUDED.resource_url, subject_id=EXCLUDED.subject_id, scopes_json=EXCLUDED.scopes_json, meta_json=EXCLUDED.meta_json, last_error=EXCLUDED.last_error, updated_at=CURRENT_TIMESTAMP",
+        )
+        .bind(&id)
+        .bind(&input.provider_id)
+        .bind(&input.driver_key)
+        .bind(input.scheme)
+        .bind(input.status)
+        .bind(input.access_token)
+        .bind(input.refresh_token)
+        .bind(input.expires_at)
+        .bind(input.resource_url)
+        .bind(input.subject_id)
+        .bind(input.scopes_json)
+        .bind(input.meta_json)
+        .bind(input.last_error)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+            .context("provider auth binding missing after upsert")
+    }
+
+    async fn delete_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DELETE FROM provider_auth_bindings WHERE provider_id = $1 AND driver_key = $2",
+        )
+        .bind(provider_id)
+        .bind(driver_key)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -302,9 +519,11 @@ struct PostgresRouteStore {
 #[async_trait]
 impl RouteStore for PostgresRouteStore {
     async fn list(&self) -> anyhow::Result<Vec<Route>> {
-        Ok(sqlx::query_as::<_, Route>(&route_select(Some("ORDER BY created_at DESC")))
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Route>(&route_select(Some("ORDER BY created_at DESC")))
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Route>> {
@@ -415,7 +634,6 @@ impl RouteStore for PostgresRouteStore {
         };
         Ok(row.is_some())
     }
-
 }
 
 #[async_trait]
@@ -510,9 +728,11 @@ impl SettingsStore for PostgresSettingsStore {
     }
 
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
-        Ok(sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 }
 
@@ -656,15 +876,17 @@ impl AuthAccessStore for PostgresAuthAccessStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(id, status, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
-            id,
-            status,
-            expires_at,
-            rpm,
-            rpd,
-            tpm,
-            tpd,
-        }))
+        Ok(row.map(
+            |(id, status, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
+                id,
+                status,
+                expires_at,
+                rpm,
+                rpd,
+                tpm,
+                tpd,
+            },
+        ))
     }
 
     async fn route_binding_exists(&self, api_key_id: &str, route_id: &str) -> anyhow::Result<bool> {
@@ -678,7 +900,11 @@ impl AuthAccessStore for PostgresAuthAccessStore {
         Ok(count > 0)
     }
 
-    async fn request_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn request_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let interval = interval_expr(window);
         let sql = format!(
             "SELECT COUNT(*) FROM request_logs WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}'"
@@ -689,7 +915,11 @@ impl AuthAccessStore for PostgresAuthAccessStore {
             .await?)
     }
 
-    async fn token_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn token_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let interval = interval_expr(window);
         let sql = format!(
             "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM request_logs WHERE api_key_id = $1 AND created_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}'"
@@ -772,7 +1002,10 @@ impl LogStore for PostgresLogStore {
             idx += 1;
         }
 
-        data_sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${idx} OFFSET ${}", idx + 1));
+        data_sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ${idx} OFFSET ${}",
+            idx + 1
+        ));
 
         let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
         let mut data_query = sqlx::query_as::<_, RequestLog>(&data_sql);
@@ -792,14 +1025,18 @@ impl LogStore for PostgresLogStore {
 
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64> {
         let interval = cutoff_expression.trim().trim_start_matches('-').trim();
-        let sql = format!("DELETE FROM request_logs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '{interval}'");
+        let sql = format!(
+            "DELETE FROM request_logs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '{interval}'"
+        );
         let result = sqlx::query(&sql).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
         let sql = if let Some(hours) = hours {
-            format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours'")
+            format!(
+                "SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours'"
+            )
         } else {
             "SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs".to_string()
         };
@@ -809,7 +1046,9 @@ impl LogStore for PostgresLogStore {
     }
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
-        let sql = format!("SELECT to_char(date_trunc('hour', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:00:00') AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY 1 ORDER BY 1 ASC");
+        let sql = format!(
+            "SELECT to_char(date_trunc('hour', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:00:00') AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY 1 ORDER BY 1 ASC"
+        );
         Ok(sqlx::query_as::<_, StatsHourly>(&sql)
             .fetch_all(&self.pool)
             .await?)
@@ -817,7 +1056,9 @@ impl LogStore for PostgresLogStore {
 
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         let sql = if let Some(hours) = hours {
-            format!("SELECT actual_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY actual_model ORDER BY request_count DESC")
+            format!(
+                "SELECT actual_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY actual_model ORDER BY request_count DESC"
+            )
         } else {
             "SELECT actual_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs GROUP BY actual_model ORDER BY request_count DESC".to_string()
         };
@@ -828,7 +1069,9 @@ impl LogStore for PostgresLogStore {
 
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
         let sql = if let Some(hours) = hours {
-            format!("SELECT provider_name AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY provider_name ORDER BY request_count DESC")
+            format!(
+                "SELECT provider_name AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '{hours} hours' GROUP BY provider_name ORDER BY request_count DESC"
+            )
         } else {
             "SELECT provider_name AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(duration_ms), 0) AS avg_duration_ms FROM request_logs GROUP BY provider_name ORDER BY request_count DESC".to_string()
         };
@@ -902,7 +1145,6 @@ impl StorageBootstrap for PostgresBootstrap {
             writable: health.can_connect,
         })
     }
-
 }
 
 fn provider_select(suffix: Option<&str>) -> String {
@@ -973,7 +1215,10 @@ fn interval_expr(window: UsageWindow) -> &'static str {
     }
 }
 
-async fn list_api_key_route_ids(pool: &Pool<Postgres>, api_key_id: &str) -> anyhow::Result<Vec<String>> {
+async fn list_api_key_route_ids(
+    pool: &Pool<Postgres>,
+    api_key_id: &str,
+) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         "SELECT route_id FROM api_key_routes WHERE api_key_id = $1 ORDER BY route_id ASC",
     )
@@ -1005,6 +1250,30 @@ async fn replace_api_key_routes(
 
     tx.commit().await?;
     Ok(())
+}
+
+fn auth_session_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, expires_at, poll_interval_seconds, last_error, created_at::text AS created_at, updated_at::text AS updated_at FROM auth_sessions",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
+}
+
+fn provider_auth_binding_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, access_token, refresh_token, expires_at::text AS expires_at, resource_url, subject_id, scopes_json, meta_json, last_error, created_at::text AS created_at, updated_at::text AS updated_at FROM provider_auth_bindings",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
 }
 
 const POSTGRES_INIT_SQL: &str = r#"
@@ -1106,4 +1375,49 @@ CREATE TABLE IF NOT EXISTS api_key_routes (
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
 CREATE INDEX IF NOT EXISTS idx_api_key_routes_route_id ON api_key_routes(route_id);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT REFERENCES providers(id) ON DELETE CASCADE,
+    driver_key TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    status TEXT NOT NULL,
+    use_proxy BOOLEAN NOT NULL DEFAULT FALSE,
+    user_code TEXT,
+    verification_uri TEXT,
+    verification_uri_complete TEXT,
+    state_json TEXT,
+    context_json TEXT,
+    result_json TEXT,
+    expires_at TIMESTAMPTZ,
+    poll_interval_seconds INTEGER,
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_provider_id ON auth_sessions(provider_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
+
+CREATE TABLE IF NOT EXISTS provider_auth_bindings (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    driver_key TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    status TEXT NOT NULL,
+    access_token TEXT,
+    refresh_token TEXT,
+    expires_at TIMESTAMPTZ,
+    resource_url TEXT,
+    subject_id TEXT,
+    scopes_json TEXT,
+    meta_json TEXT,
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider_id, driver_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_auth_bindings_provider_id
+    ON provider_auth_bindings(provider_id);
 "#;

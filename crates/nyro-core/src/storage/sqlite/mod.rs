@@ -5,6 +5,10 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::SqlitePool;
 
+use crate::auth::types::{
+    AuthSession, CreateAuthSession, ProviderAuthBinding, UpdateAuthSession,
+    UpsertProviderAuthBinding,
+};
 use crate::config::GatewayConfig;
 use crate::db;
 use crate::db::models::{
@@ -14,9 +18,10 @@ use crate::db::models::{
 };
 use crate::logging::LogEntry;
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ProviderStore, ProviderTestResult,
-    RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage, StorageBackend,
-    StorageBootstrap, StorageHealth, UsageWindow,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, AuthSessionStore, LogStore,
+    ProviderAuthBindingStore, ProviderStore, ProviderTestResult, RouteSnapshotStore, RouteStore,
+    RouteTargetStore, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
+    UsageWindow,
 };
 
 #[derive(Clone)]
@@ -27,6 +32,8 @@ pub struct SqliteStorage {
     route_target_store: Arc<SqliteRouteTargetStore>,
     settings_store: Arc<SqliteSettingsStore>,
     api_key_store: Arc<SqliteApiKeyStore>,
+    auth_session_store: Arc<SqliteAuthSessionStore>,
+    provider_auth_binding_store: Arc<SqliteProviderAuthBindingStore>,
     auth_store: Arc<SqliteAuthAccessStore>,
     log_store: Arc<SqliteLogStore>,
     bootstrap: Arc<SqliteBootstrap>,
@@ -46,6 +53,9 @@ impl SqliteStorage {
         let route_target_store = Arc::new(SqliteRouteTargetStore { pool: pool.clone() });
         let settings_store = Arc::new(SqliteSettingsStore { pool: pool.clone() });
         let api_key_store = Arc::new(SqliteApiKeyStore { pool: pool.clone() });
+        let auth_session_store = Arc::new(SqliteAuthSessionStore { pool: pool.clone() });
+        let provider_auth_binding_store =
+            Arc::new(SqliteProviderAuthBindingStore { pool: pool.clone() });
         let auth_store = Arc::new(SqliteAuthAccessStore { pool: pool.clone() });
         let log_store = Arc::new(SqliteLogStore { pool: pool.clone() });
         let bootstrap = Arc::new(SqliteBootstrap { pool: pool.clone() });
@@ -56,6 +66,8 @@ impl SqliteStorage {
             route_target_store,
             settings_store,
             api_key_store,
+            auth_session_store,
+            provider_auth_binding_store,
             auth_store,
             log_store,
             bootstrap,
@@ -92,6 +104,14 @@ impl Storage for SqliteStorage {
         Some(self.api_key_store.as_ref())
     }
 
+    fn auth_sessions(&self) -> Option<&dyn AuthSessionStore> {
+        Some(self.auth_session_store.as_ref())
+    }
+
+    fn provider_auth_bindings(&self) -> Option<&dyn ProviderAuthBindingStore> {
+        Some(self.provider_auth_binding_store.as_ref())
+    }
+
     fn auth(&self) -> Option<&dyn AuthAccessStore> {
         Some(self.auth_store.as_ref())
     }
@@ -107,6 +127,16 @@ impl Storage for SqliteStorage {
 
 #[derive(Clone)]
 struct SqliteProviderStore {
+    pool: SqlitePool,
+}
+
+#[derive(Clone)]
+struct SqliteAuthSessionStore {
+    pool: SqlitePool,
+}
+
+#[derive(Clone)]
+struct SqliteProviderAuthBindingStore {
     pool: SqlitePool,
 }
 
@@ -157,27 +187,27 @@ impl ProviderStore for SqliteProviderStore {
         .bind(input.use_proxy)
         .execute(&self.pool)
         .await?;
-        self.get(&id).await?.context("provider missing after create")
+        self.get(&id)
+            .await?
+            .context("provider missing after create")
     }
 
     async fn update(&self, id: &str, input: UpdateProvider) -> anyhow::Result<Provider> {
-        let current = self.get(id).await?.context("provider not found for update")?;
-        let models_source_input = input
-            .effective_models_source()
-            .map(ToString::to_string);
+        let current = self
+            .get(id)
+            .await?
+            .context("provider not found for update")?;
+        let models_source_input = input.effective_models_source().map(ToString::to_string);
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
             normalize_provider_vendor(input.vendor.as_deref())
         } else {
             normalize_provider_vendor(current.vendor.as_deref())
         };
-        let models_source = models_source_input
-            .or_else(|| current.models_source.clone());
+        let models_source = models_source_input.or_else(|| current.models_source.clone());
         let protocol = input.protocol.unwrap_or(current.protocol.clone());
         let base_url = input.base_url.unwrap_or(current.base_url);
-        let default_protocol = input
-            .default_protocol
-            .unwrap_or(current.default_protocol);
+        let default_protocol = input.default_protocol.unwrap_or(current.default_protocol);
         let protocol_endpoints = input
             .protocol_endpoints
             .unwrap_or(current.protocol_endpoints);
@@ -241,7 +271,11 @@ impl ProviderStore for SqliteProviderStore {
         Ok(row.is_some())
     }
 
-    async fn record_test_result(&self, provider_id: &str, result: ProviderTestResult) -> anyhow::Result<()> {
+    async fn record_test_result(
+        &self,
+        provider_id: &str,
+        result: ProviderTestResult,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE providers SET last_test_success = ?, last_test_at = datetime('now') WHERE id = ?",
         )
@@ -253,11 +287,220 @@ impl ProviderStore for SqliteProviderStore {
     }
 }
 
+#[async_trait]
+impl AuthSessionStore for SqliteAuthSessionStore {
+    async fn list(&self) -> anyhow::Result<Vec<AuthSession>> {
+        Ok(sqlx::query_as::<_, AuthSession>(&auth_session_select(None))
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn get(&self, id: &str) -> anyhow::Result<Option<AuthSession>> {
+        Ok(
+            sqlx::query_as::<_, AuthSession>(&auth_session_select(Some("WHERE id = ?")))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn create(&self, input: CreateAuthSession) -> anyhow::Result<AuthSession> {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO auth_sessions (id, provider_id, driver_key, scheme, status, use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, expires_at, poll_interval_seconds, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(input.provider_id)
+        .bind(input.driver_key)
+        .bind(input.scheme)
+        .bind(input.status)
+        .bind(input.use_proxy)
+        .bind(input.user_code)
+        .bind(input.verification_uri)
+        .bind(input.verification_uri_complete)
+        .bind(input.state_json)
+        .bind(input.context_json)
+        .bind(input.result_json)
+        .bind(input.expires_at)
+        .bind(input.poll_interval_seconds)
+        .bind(input.last_error)
+        .execute(&self.pool)
+        .await?;
+        self.get(&id)
+            .await?
+            .context("auth session missing after create")
+    }
+
+    async fn update(&self, id: &str, input: UpdateAuthSession) -> anyhow::Result<AuthSession> {
+        let current = self
+            .get(id)
+            .await?
+            .context("auth session not found for update")?;
+        sqlx::query(
+            "UPDATE auth_sessions SET status=?, user_code=?, verification_uri=?, verification_uri_complete=?, state_json=?, context_json=?, result_json=?, expires_at=?, poll_interval_seconds=?, last_error=?, updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(input.status.unwrap_or(current.status))
+        .bind(input.user_code.or(current.user_code))
+        .bind(input.verification_uri.or(current.verification_uri))
+        .bind(input.verification_uri_complete.or(current.verification_uri_complete))
+        .bind(input.state_json.or(current.state_json))
+        .bind(input.context_json.or(current.context_json))
+        .bind(input.result_json.or(current.result_json))
+        .bind(input.expires_at.or(current.expires_at))
+        .bind(input.poll_interval_seconds.or(current.poll_interval_seconds))
+        .bind(input.last_error.or(current.last_error))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get(id)
+            .await?
+            .context("auth session missing after update")
+    }
+
+    async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM auth_sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM auth_sessions WHERE expires_at IS NOT NULL AND trim(expires_at) != '' AND datetime(expires_at) <= datetime('now')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[async_trait]
+impl ProviderAuthBindingStore for SqliteProviderAuthBindingStore {
+    async fn list_by_provider(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = ?",
+            )))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn get_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<Option<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = ? AND driver_key = ?",
+            )))
+            .bind(provider_id)
+            .bind(driver_key)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn upsert(
+        &self,
+        input: UpsertProviderAuthBinding,
+    ) -> anyhow::Result<ProviderAuthBinding> {
+        if let Some(existing) = self
+            .get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+        {
+            sqlx::query(
+                "UPDATE provider_auth_bindings SET scheme=?, status=?, access_token=?, refresh_token=?, expires_at=?, resource_url=?, subject_id=?, scopes_json=?, meta_json=?, last_error=?, updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(input.scheme)
+            .bind(input.status)
+            .bind(input.access_token)
+            .bind(input.refresh_token)
+            .bind(input.expires_at)
+            .bind(input.resource_url)
+            .bind(input.subject_id)
+            .bind(input.scopes_json)
+            .bind(input.meta_json)
+            .bind(input.last_error)
+            .bind(&existing.id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO provider_auth_bindings (id, provider_id, driver_key, scheme, status, access_token, refresh_token, expires_at, resource_url, subject_id, scopes_json, meta_json, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&input.provider_id)
+            .bind(&input.driver_key)
+            .bind(input.scheme)
+            .bind(input.status)
+            .bind(input.access_token)
+            .bind(input.refresh_token)
+            .bind(input.expires_at)
+            .bind(input.resource_url)
+            .bind(input.subject_id)
+            .bind(input.scopes_json)
+            .bind(input.meta_json)
+            .bind(input.last_error)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+            .context("provider auth binding missing after upsert")
+    }
+
+    async fn delete_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM provider_auth_bindings WHERE provider_id = ? AND driver_key = ?")
+            .bind(provider_id)
+            .bind(driver_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
 fn normalize_provider_vendor(vendor: Option<&str>) -> Option<String> {
     vendor
         .map(str::trim)
         .filter(|v| !v.is_empty() && *v != "custom")
         .map(|v| v.to_lowercase())
+}
+
+fn auth_session_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, COALESCE(use_proxy, 0) AS use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, expires_at, poll_interval_seconds, last_error, created_at, updated_at FROM auth_sessions",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
+}
+
+fn provider_auth_binding_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, access_token, refresh_token, expires_at, resource_url, subject_id, scopes_json, meta_json, last_error, created_at, updated_at FROM provider_auth_bindings",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
 }
 
 #[derive(Clone)]
@@ -438,7 +681,6 @@ impl RouteStore for SqliteRouteStore {
         };
         Ok(row.is_some())
     }
-
 }
 
 #[async_trait]
@@ -543,9 +785,11 @@ impl SettingsStore for SqliteSettingsStore {
     }
 
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
-        Ok(sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 }
 
@@ -630,9 +874,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         .await?;
 
         replace_api_key_routes(&self.pool, &id, &input.route_ids).await?;
-        self.get(&id)
-            .await?
-            .context("api key missing after create")
+        self.get(&id).await?.context("api key missing after create")
     }
 
     async fn update(&self, id: &str, input: UpdateApiKey) -> anyhow::Result<ApiKeyWithBindings> {
@@ -670,9 +912,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
             replace_api_key_routes(&self.pool, id, &route_ids).await?;
         }
 
-        self.get(id)
-            .await?
-            .context("api key missing after update")
+        self.get(id).await?.context("api key missing after update")
     }
 
     async fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -725,7 +965,9 @@ impl AuthAccessStore for SqliteAuthAccessStore {
                 Option<i32>,
                 Option<i32>,
             ),
-        >("SELECT id, status, expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE key = ?")
+        >(
+            "SELECT id, status, expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE key = ?"
+        )
         .bind(raw_key)
         .fetch_optional(&self.pool)
         .await?;
@@ -754,7 +996,11 @@ impl AuthAccessStore for SqliteAuthAccessStore {
         Ok(count > 0)
     }
 
-    async fn request_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn request_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let expr = match window {
             UsageWindow::Minute => "-1 minute",
             UsageWindow::Day => "-1 day",
@@ -768,7 +1014,11 @@ impl AuthAccessStore for SqliteAuthAccessStore {
         .await?)
     }
 
-    async fn token_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn token_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let expr = match window {
             UsageWindow::Minute => "-1 minute",
             UsageWindow::Day => "-1 day",
@@ -783,7 +1033,10 @@ impl AuthAccessStore for SqliteAuthAccessStore {
     }
 }
 
-async fn list_api_key_route_ids(pool: &SqlitePool, api_key_id: &str) -> anyhow::Result<Vec<String>> {
+async fn list_api_key_route_ids(
+    pool: &SqlitePool,
+    api_key_id: &str,
+) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         "SELECT route_id FROM api_key_routes WHERE api_key_id = ? ORDER BY route_id ASC",
     )
@@ -989,5 +1242,4 @@ impl StorageBootstrap for SqliteBootstrap {
             writable: true,
         })
     }
-
 }

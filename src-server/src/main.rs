@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use axum::http::{HeaderValue, Method, header};
+use clap::Parser;
 use nyro_core::{
     Gateway,
     config::{
@@ -53,7 +53,11 @@ struct Args {
     )]
     proxy_cors_origins: Vec<String>,
 
-    #[arg(long, default_value = "./webui/dist", help = "Path to webui static files")]
+    #[arg(
+        long,
+        default_value = "./webui/dist",
+        help = "Path to webui static files"
+    )]
     webui_dir: String,
 
     #[arg(long, value_parser = ["sqlite", "postgres", "mysql"], default_value = "sqlite")]
@@ -244,7 +248,10 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn default_local_origins(ports: &[u16]) -> Vec<String> {
-    let mut origins = vec!["tauri://localhost".to_string(), "http://tauri.localhost".to_string()];
+    let mut origins = vec![
+        "tauri://localhost".to_string(),
+        "http://tauri.localhost".to_string(),
+    ];
     for port in ports {
         origins.push(format!("http://127.0.0.1:{port}"));
         origins.push(format!("http://localhost:{port}"));
@@ -272,7 +279,13 @@ fn parse_allow_origin(origins: &[String]) -> AllowOrigin {
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(parse_allow_origin(origins))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -313,10 +326,7 @@ fn parse_storage_backend(value: &str) -> anyhow::Result<StorageBackendKind> {
     }
 }
 
-fn resolve_storage_dsn(
-    args: &Args,
-    backend: StorageBackendKind,
-) -> anyhow::Result<Option<String>> {
+fn resolve_storage_dsn(args: &Args, backend: StorageBackendKind) -> anyhow::Result<Option<String>> {
     if matches!(backend, StorageBackendKind::Sqlite) {
         return Ok(None);
     }

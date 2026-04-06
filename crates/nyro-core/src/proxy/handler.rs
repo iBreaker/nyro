@@ -1,5 +1,5 @@
-use std::convert::Infallible;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::time::Instant;
 
 use async_trait::async_trait;

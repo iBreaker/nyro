@@ -1,10 +1,10 @@
 mod commands;
 
-use nyro_core::{config::GatewayConfig, logging, Gateway};
+use nyro_core::{Gateway, config::GatewayConfig, logging};
 use tauri::{
+    Manager,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -69,6 +69,11 @@ pub fn run() {
             commands::test_provider_models,
             commands::get_provider_models,
             commands::get_model_capabilities,
+            commands::init_oauth_session,
+            commands::get_oauth_session_status,
+            commands::cancel_oauth_session,
+            commands::complete_oauth_session,
+            commands::create_oauth_provider,
             commands::list_routes,
             commands::create_route,
             commands::update_route,

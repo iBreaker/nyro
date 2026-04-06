@@ -19,14 +19,21 @@ impl ProxyClient {
         base_url: &str,
         path: &str,
         api_key: &str,
+        disable_default_auth: bool,
         body: Value,
         extra_headers: HeaderMap,
     ) -> Result<(Value, u16)> {
-        let url = adapter.build_url(base_url, path, api_key);
-        let mut headers = adapter.auth_headers(api_key);
+        let url = adapter.build_url(base_url, path, api_key, disable_default_auth);
+        let mut headers = adapter.auth_headers(api_key, disable_default_auth);
         headers.extend(extra_headers);
 
-        let resp = self.http.post(&url).headers(headers).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status().as_u16();
         let json: Value = resp.json().await?;
         Ok((json, status))
@@ -38,14 +45,21 @@ impl ProxyClient {
         base_url: &str,
         path: &str,
         api_key: &str,
+        disable_default_auth: bool,
         body: Value,
         extra_headers: HeaderMap,
     ) -> Result<(reqwest::Response, u16)> {
-        let url = adapter.build_url(base_url, path, api_key);
-        let mut headers = adapter.auth_headers(api_key);
+        let url = adapter.build_url(base_url, path, api_key, disable_default_auth);
+        let mut headers = adapter.auth_headers(api_key, disable_default_auth);
         headers.extend(extra_headers);
 
-        let resp = self.http.post(&url).headers(headers).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status().as_u16();
         Ok((resp, status))
     }

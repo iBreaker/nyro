@@ -7,6 +7,8 @@ import type {
   CreateProvider,
   UpdateProvider,
   TestResult,
+  OAuthSessionInitData,
+  OAuthSessionStatusData,
   ProviderPreset,
   ProviderChannelPreset,
   ProviderProtocol,
@@ -52,6 +54,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { openExternalUrl } from "@/lib/open-external";
 
 function protocolUrl(protocol: string) {
   switch (protocol) {
@@ -67,6 +70,8 @@ const emptyCreate: CreateProvider = {
   protocol: "openai",
   base_url: "https://api.openai.com",
   use_proxy: false,
+  auth_mode: "apikey",
+  oauth_resource_url: "",
   preset_key: "",
   channel: "",
   models_source: "",
@@ -247,6 +252,18 @@ function toGatewayBaseUrl(url: string) {
   return normalized;
 }
 
+function normalizeOAuthResourceBaseUrl(resourceUrl?: string | null, vendor?: string | null) {
+  const raw = resourceUrl?.trim();
+  if (!raw) return "";
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  const normalized = withScheme.replace(/\/+$/, "");
+  const vendorKey = (vendor ?? "").trim().toLowerCase();
+  if (vendorKey === "qwen-code-cli" && !normalized.endsWith("/v1")) {
+    return `${normalized}/v1`;
+  }
+  return normalized;
+}
+
 function defaultModelsEndpoint(baseUrl: string, protocol: ProviderProtocol) {
   const normalized = baseUrl.trim().replace(/\/+$/, "");
   let parsed: URL | null = null;
@@ -297,12 +314,50 @@ function fallbackProviderPreset(): ProviderPreset {
     id: DEFAULT_PRESET_ID,
     label: { zh: "自定义", en: "Custom" },
     defaultProtocol: "openai",
+    authMode: "apikey",
     channels: [],
   };
 }
 
 function presetChannels(preset?: ProviderPreset | null) {
   return preset?.channels?.length ? preset.channels : [fallbackChannelPreset()];
+}
+
+function previewOAuthPreset(): ProviderPreset {
+  return {
+    id: "qwen-code-cli",
+    label: { zh: "Qwen Code", en: "Qwen Code" },
+    icon: "qwen",
+    defaultProtocol: "openai",
+    authMode: "oauth",
+    channels: [
+      {
+        id: "default",
+        label: { zh: "默认", en: "Default" },
+        baseUrls: {
+          openai: "https://portal.qwen.ai/v1",
+        },
+        modelsSource: "https://chat.qwen.ai/api/models",
+        capabilitiesSource: "ai://models.dev/alibaba",
+      },
+    ],
+  };
+}
+
+function presetAuthMode(preset?: ProviderPreset | null): "apikey" | "oauth" {
+  return preset?.authMode === "oauth" ? "oauth" : "apikey";
+}
+
+function normalizeAuthMode(mode?: string | null): "apikey" | "oauth" {
+  if (!mode) return "apikey";
+  const normalized = mode.trim().toLowerCase();
+  if (normalized === "oauth") return "oauth";
+  if (normalized === "api_key") return "apikey";
+  return "apikey";
+}
+
+function sortPresetForDisplay(a: ProviderPreset, b: ProviderPreset) {
+  return a.id === DEFAULT_PRESET_ID ? -1 : b.id === DEFAULT_PRESET_ID ? 1 : 0;
 }
 
 function resolvePresetConfig(
@@ -418,10 +473,17 @@ export default function ProvidersPage() {
   const [isTestRunning, setIsTestRunning] = useState(false);
   const [testTarget, setTestTarget] = useState<Provider | null>(null);
   const [providerToDelete, setProviderToDelete] = useState<Provider | null>(null);
+  const [createAuthMode, setCreateAuthMode] = useState<"apikey" | "oauth">("apikey");
   const [selectedPresetId, setSelectedPresetId] = useState(DEFAULT_PRESET_ID);
   const [showCreateApiKey, setShowCreateApiKey] = useState(true);
   const [showEditApiKey, setShowEditApiKey] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
+  const [createOAuthSession, setCreateOAuthSession] = useState<OAuthSessionInitData | null>(null);
+  const [createOAuthStatus, setCreateOAuthStatus] = useState<OAuthSessionStatusData | null>(null);
+  const [createOAuthBusy, setCreateOAuthBusy] = useState(false);
+  const [createOAuthCallbackUrl, setCreateOAuthCallbackUrl] = useState("");
+  const [createOAuthCode, setCreateOAuthCode] = useState("");
+  const createOAuthPollerRef = useRef<number | null>(null);
   const activeTestRunRef = useRef(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -435,7 +497,10 @@ export default function ProvidersPage() {
   });
   const { data: proxyEnabledSetting } = useQuery<string | null>({
     queryKey: ["setting", "proxy_enabled"],
-    queryFn: () => backend("get_setting", { key: "proxy_enabled" }),
+    queryFn: async () => {
+      const value = await backend<unknown>("get_setting", { key: "proxy_enabled" });
+      return typeof value === "string" ? value : null;
+    },
   });
   const providerPresets = useMemo(
     () => (providerPresetsRaw.length ? providerPresetsRaw : [fallbackProviderPreset()]),
@@ -445,19 +510,31 @@ export default function ProvidersPage() {
     const normalized = (proxyEnabledSetting ?? "").trim().toLowerCase();
     return ["1", "true", "yes", "on"].includes(normalized);
   }, [proxyEnabledSetting]);
+  const createProviderPresets = useMemo(
+    () => (
+      providerPresets.some((preset) => presetAuthMode(preset) === "oauth")
+        ? providerPresets
+        : [...providerPresets, previewOAuthPreset()]
+    ),
+    [providerPresets],
+  );
+  const createPresetOptions = useMemo(
+    () => createProviderPresets.filter((preset) => presetAuthMode(preset) === createAuthMode),
+    [createProviderPresets, createAuthMode],
+  );
 
   const [form, setForm] = useState<CreateProvider>(emptyCreate);
   const [createEndpointRows, setCreateEndpointRows] = useState<ProtocolEndpointRow[]>([
     { protocol: "openai", base_url: "https://api.openai.com" },
   ]);
   const selectedPreset = useMemo(
-    () => providerPresets.find((preset) => preset.id === selectedPresetId) ?? null,
-    [providerPresets, selectedPresetId],
+    () => createPresetOptions.find((preset) => preset.id === selectedPresetId) ?? null,
+    [createPresetOptions, selectedPresetId],
   );
   useEffect(() => {
-    if (providerPresets.some((preset) => preset.id === selectedPresetId)) return;
-    setSelectedPresetId(providerPresets[0]?.id ?? DEFAULT_PRESET_ID);
-  }, [providerPresets, selectedPresetId]);
+    if (createPresetOptions.some((preset) => preset.id === selectedPresetId)) return;
+    setSelectedPresetId(createPresetOptions[0]?.id ?? "");
+  }, [createPresetOptions, selectedPresetId]);
 
   const [editForm, setEditForm] = useState<UpdateProvider & { id: string }>({
     id: "",
@@ -472,6 +549,8 @@ export default function ProvidersPage() {
     capabilities_source: "",
     static_models: "",
     api_key: "",
+    auth_mode: "apikey",
+    oauth_resource_url: "",
   });
   const [editEndpointRows, setEditEndpointRows] = useState<ProtocolEndpointRow[]>([
     { protocol: "openai", base_url: "https://api.openai.com" },
@@ -481,14 +560,24 @@ export default function ProvidersPage() {
     mutationFn: (input: CreateProvider) => backend<Provider>("create_provider", { input }),
     onSuccess: async (createdProvider: Provider) => {
       qc.invalidateQueries({ queryKey: ["providers"] });
-      setShowForm(false);
-      setSelectedPresetId(DEFAULT_PRESET_ID);
-      setForm(emptyCreate);
-      setCreateEndpointRows([{ protocol: "openai", base_url: "https://api.openai.com" }]);
+      closeCreateForm();
       await handleTest(createdProvider);
     },
     onError: (error: unknown) => {
       showErrorDialog("创建提供商失败", "Failed to create provider", error);
+    },
+  });
+
+  const createOAuthMut = useMutation({
+    mutationFn: ({ sessionId, input }: { sessionId: string; input: CreateProvider }) =>
+      backend<Provider>("create_oauth_provider", { sessionId, input }),
+    onSuccess: async (createdProvider: Provider) => {
+      qc.invalidateQueries({ queryKey: ["providers"] });
+      closeCreateForm();
+      await handleTest(createdProvider);
+    },
+    onError: (error: unknown) => {
+      showErrorDialog("创建 OAuth 提供商失败", "Failed to create OAuth provider", error);
     },
   });
 
@@ -536,6 +625,216 @@ export default function ProvidersPage() {
     setIsTestRunning(false);
     setTestingId(null);
     setTestDialogOpen(false);
+  }
+
+  function stopCreateOAuthPolling() {
+    if (createOAuthPollerRef.current != null) {
+      window.clearInterval(createOAuthPollerRef.current);
+      createOAuthPollerRef.current = null;
+    }
+  }
+
+  function resetCreateOAuthState(cancelRemote = false) {
+    const sessionId = createOAuthSession?.session_id;
+    stopCreateOAuthPolling();
+    setCreateOAuthSession(null);
+    setCreateOAuthStatus(null);
+    setCreateOAuthBusy(false);
+    setCreateOAuthCallbackUrl("");
+    setCreateOAuthCode("");
+    if (cancelRemote && sessionId) {
+      void backend("cancel_oauth_session", { sessionId }).catch(() => {
+        // Best-effort cleanup only.
+      });
+    }
+  }
+
+  async function startCreateOAuth() {
+    const vendor = selectedPreset?.id || form.vendor;
+    if (!vendor) {
+      setErrorDialog({
+        title: isZh ? "无法发起 OAuth" : "Cannot start OAuth",
+        description: isZh ? "请先选择 OAuth 供应商预设。" : "Please select an OAuth provider preset first.",
+      });
+      return;
+    }
+
+    resetCreateOAuthState(true);
+    setCreateOAuthBusy(true);
+    try {
+      const init = await backend<OAuthSessionInitData>("init_oauth_session", {
+        vendor,
+        useProxy: Boolean(form.use_proxy),
+      });
+      setCreateOAuthSession(init);
+      setCreateOAuthStatus({
+        status: "pending",
+        scheme: init.scheme,
+        auth_url: init.auth_url,
+        requires_manual_code: init.requires_manual_code,
+        expires_in: init.expires_in,
+        interval: init.interval,
+        user_code: init.user_code,
+        verification_uri_complete: init.verification_uri_complete,
+      });
+      setForm((prev) => {
+        if (prev.name.trim()) return prev;
+        const providerName = selectedPreset ? presetLabel(selectedPreset, false).trim() : vendor.trim();
+        const suffix = init.user_code?.trim() ? `-${init.user_code.trim()}` : "";
+        return {
+          ...prev,
+          name: providerName ? `${providerName}${suffix}` : prev.name,
+        };
+      });
+
+      const authUrl = init.auth_url || init.verification_uri_complete;
+      if (authUrl) {
+        void openExternalUrl(authUrl).catch((error) => {
+          setCreateOAuthStatus((prev) => prev ?? {
+            status: "error",
+            code: "OAUTH_OPEN_BROWSER_FAILED",
+            message: normalizeErrorMessage(error),
+          });
+        });
+      }
+
+      if (init.requires_manual_code) {
+        setCreateOAuthBusy(false);
+        return;
+      }
+
+      const intervalMs = Math.max(2, Number(init.interval) || 2) * 1000;
+      createOAuthPollerRef.current = window.setInterval(async () => {
+        try {
+          const status = await backend<OAuthSessionStatusData>("get_oauth_session_status", {
+            sessionId: init.session_id,
+          });
+          setCreateOAuthStatus(status);
+          if (status.status === "pending") {
+            if ((status.expires_in ?? 0) <= 0) {
+              stopCreateOAuthPolling();
+              setCreateOAuthBusy(false);
+              setCreateOAuthStatus({
+                status: "error",
+                code: "OAUTH_TIMEOUT",
+                message: isZh ? "授权会话已超时，请重新发起授权。" : "OAuth session timed out, please start again.",
+              });
+            }
+            return;
+          }
+
+          stopCreateOAuthPolling();
+          setCreateOAuthBusy(false);
+          if (status.status === "ready") {
+            setForm((prev) => ({
+              ...prev,
+              base_url: normalizeOAuthResourceBaseUrl(status.resource_url, init.vendor) || prev.base_url,
+              oauth_resource_url: status.resource_url ?? prev.oauth_resource_url,
+            }));
+          }
+        } catch (error) {
+          stopCreateOAuthPolling();
+          setCreateOAuthBusy(false);
+          setCreateOAuthStatus({
+            status: "error",
+            code: "OAUTH_STATUS_FAILED",
+            message: normalizeErrorMessage(error),
+          });
+        }
+      }, intervalMs);
+    } catch (error) {
+      setCreateOAuthBusy(false);
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_INIT_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    }
+  }
+
+  async function cancelCreateOAuth() {
+    const sessionId = createOAuthSession?.session_id;
+    stopCreateOAuthPolling();
+    setCreateOAuthBusy(false);
+    if (!sessionId) {
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_CANCELLED",
+        message: isZh ? "已取消" : "Cancelled",
+      });
+      return;
+    }
+    try {
+      await backend("cancel_oauth_session", { sessionId });
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_CANCELLED",
+        message: isZh ? "已取消" : "Cancelled",
+      });
+    } catch (error) {
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_CANCEL_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    }
+  }
+
+  async function reopenCreateOAuthPage() {
+    const authUrl = createOAuthSession?.auth_url || createOAuthSession?.verification_uri_complete;
+    if (!authUrl) return;
+    try {
+      await openExternalUrl(authUrl);
+    } catch (error) {
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_OPEN_BROWSER_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    }
+  }
+
+  async function completeCreateOAuth() {
+    const sessionId = createOAuthSession?.session_id;
+    if (!sessionId) return;
+
+    const callbackUrl = createOAuthCallbackUrl.trim();
+    const code = createOAuthCode.trim();
+    if (!callbackUrl && !code) {
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_INPUT_REQUIRED",
+        message: isZh
+          ? "请粘贴完整回调地址，或单独填写授权码。"
+          : "Paste the full callback URL or enter the authorization code.",
+      });
+      return;
+    }
+
+    setCreateOAuthBusy(true);
+    try {
+      const status = await backend<OAuthSessionStatusData>("complete_oauth_session", {
+        sessionId,
+        callbackUrl: callbackUrl || undefined,
+        code: code || undefined,
+      });
+      setCreateOAuthStatus(status);
+      if (status.status === "ready") {
+        setForm((prev) => ({
+          ...prev,
+          base_url: normalizeOAuthResourceBaseUrl(status.resource_url, createOAuthSession.vendor) || prev.base_url,
+          oauth_resource_url: status.resource_url ?? prev.oauth_resource_url,
+        }));
+      }
+    } catch (error) {
+      setCreateOAuthStatus({
+        status: "error",
+        code: "OAUTH_COMPLETE_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    } finally {
+      setCreateOAuthBusy(false);
+    }
   }
 
   async function handleTest(provider: Provider) {
@@ -604,7 +903,8 @@ export default function ProvidersPage() {
       );
 
       const modelsSource = provider.models_source?.trim();
-      if (!modelsSource) {
+      const staticModels = provider.static_models?.trim();
+      if (!modelsSource && !staticModels) {
         finish(
           { success: true, latency_ms: connectivity.latency_ms, model: undefined, error: undefined },
           isZh ? "✓ 未配置模型发现源，测试完成" : "✓ Model discovery source not configured, test finished",
@@ -614,7 +914,10 @@ export default function ProvidersPage() {
       }
 
       appendTestLog("info", isZh ? "▶ 获取模型列表" : "▶ Fetch model list");
-      appendTestLog("info", `→ ${modelsSource}`);
+      appendTestLog(
+        "info",
+        modelsSource ? `→ ${modelsSource}` : (isZh ? "→ 使用预置模型列表" : "→ Using preconfigured model list"),
+      );
 
       const models = await backend<string[]>("test_provider_models", { id: provider.id });
       if (isCanceled()) return;
@@ -677,14 +980,19 @@ export default function ProvidersPage() {
       capabilities_source: p.capabilities_source ?? "",
       static_models: p.static_models ?? "",
       api_key: p.api_key ?? "",
+      auth_mode: normalizeAuthMode(p.auth_mode),
+      oauth_resource_url: p.oauth_resource_url ?? "",
     });
     setEditEndpointRows(endpointRows);
   }
 
   function handlePresetChange(nextPresetId: string) {
     if (!nextPresetId) return;
+    resetCreateOAuthState(true);
     setSelectedPresetId(nextPresetId);
-    const preset = providerPresets.find((item) => item.id === nextPresetId);
+    const preset =
+      createPresetOptions.find((item) => item.id === nextPresetId)
+      ?? createProviderPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
 
     const nextChannelId = preset.channels?.[0]?.id ?? "";
@@ -693,18 +1001,22 @@ export default function ProvidersPage() {
     const endpointRows = endpointRowsFromPreset(preset, nextChannelId, nextProtocol);
     const nextBaseUrl = resolveDefaultBaseUrl(endpointRows, nextProtocol, config.baseUrl);
 
-    setForm((prev) => ({
-      ...prev,
+    setForm({
+      ...emptyCreate,
       vendor: preset.id === DEFAULT_PRESET_ID ? undefined : preset.id,
       protocol: nextProtocol,
       base_url: nextBaseUrl,
+      use_proxy: false,
+      auth_mode: presetAuthMode(preset),
+      oauth_resource_url: "",
       preset_key: preset.id,
       channel: nextChannelId,
       models_source: config.modelsSource,
       capabilities_source: config.capabilitiesSource,
       static_models: config.staticModels,
-      api_key: config.apiKey || prev.api_key,
-    }));
+      api_key: config.apiKey || "",
+      name: "",
+    });
     setCreateEndpointRows(endpointRows);
   }
 
@@ -722,6 +1034,7 @@ export default function ProvidersPage() {
       ...prev,
       channel: nextChannelId,
       protocol: nextProtocol,
+      auth_mode: presetAuthMode(selectedPreset),
       base_url: nextBaseUrl,
       models_source: config.modelsSource,
       capabilities_source: config.capabilitiesSource,
@@ -767,11 +1080,27 @@ export default function ProvidersPage() {
   }
 
   function closeCreateForm() {
+    resetCreateOAuthState(true);
     setShowForm(false);
     setShowCreateApiKey(true);
+    setCreateAuthMode("apikey");
     setSelectedPresetId(DEFAULT_PRESET_ID);
     setForm(emptyCreate);
     setCreateEndpointRows([{ protocol: "openai", base_url: "https://api.openai.com" }]);
+  }
+
+  function handleCreateAuthModeChange(nextMode: "apikey" | "oauth") {
+    if (nextMode === createAuthMode) return;
+    resetCreateOAuthState(true);
+    setCreateAuthMode(nextMode);
+    setShowCreateApiKey(true);
+    const nextPresetId = createProviderPresets.find((preset) => presetAuthMode(preset) === nextMode)?.id;
+    if (!nextPresetId) {
+      setSelectedPresetId("");
+      setForm({ ...emptyCreate, auth_mode: nextMode });
+      return;
+    }
+    handlePresetChange(nextPresetId);
   }
 
   const totalPages = Math.max(1, Math.ceil(providers.length / PAGE_SIZE));
@@ -784,6 +1113,12 @@ export default function ProvidersPage() {
   const createProtocolOptions = protocolOptions.filter((option) =>
     availableProtocolsForPreset(selectedPreset, createChannelValue).includes(option.value),
   );
+  const hasCreatePresets = createPresetOptions.length > 0;
+  const createOAuthReady = createOAuthStatus?.status === "ready";
+  const createOAuthRequiresManualCode =
+    createOAuthStatus?.status === "pending"
+      ? createOAuthStatus.requires_manual_code
+      : createOAuthSession?.requires_manual_code ?? false;
 
   useEffect(() => {
     if (page > totalPages - 1) {
@@ -817,6 +1152,12 @@ export default function ProvidersPage() {
     });
   }, [isLoading, providers]);
 
+  useEffect(() => {
+    return () => {
+      stopCreateOAuthPolling();
+    };
+  }, []);
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
@@ -835,7 +1176,15 @@ export default function ProvidersPage() {
             }
             setShowForm(true);
             setShowCreateApiKey(true);
-            handlePresetChange(DEFAULT_PRESET_ID);
+            resetCreateOAuthState(true);
+            setCreateAuthMode("apikey");
+            const initialPresetId = createProviderPresets.find((preset) => presetAuthMode(preset) === "apikey")?.id;
+            if (initialPresetId) {
+              handlePresetChange(initialPresetId);
+            } else {
+              setSelectedPresetId("");
+              setForm({ ...emptyCreate, auth_mode: "apikey" });
+            }
           }}
           className="flex items-center gap-2"
         >
@@ -851,68 +1200,105 @@ export default function ProvidersPage() {
           <div className="space-y-3">
             <div>
               <p className="text-sm font-semibold text-slate-700">
-                {isZh ? "1. 快速选择常用模型供应商（可选）" : "1. Quick Select A Common Provider (Optional)"}
+                {isZh ? "1. 选择认证方式" : "1. Select Auth Mode"}
               </p>
               <p className="mt-1 text-xs text-slate-500">
                 {isZh
-                  ? "选择预设后会自动填充默认配置，后续可继续手动修改。"
-                  : "Selecting a preset prefills default values, and you can still edit them."}
+                  ? "选择 API Key 或 OAuth Account。切换后会重置当前创建表单。"
+                  : "Choose API Key or OAuth Account. Switching mode resets the current create form."}
               </p>
             </div>
             <ToggleGroup
               type="single"
-              value={selectedPresetId}
-              onValueChange={handlePresetChange}
-              className="provider-preset-group"
+              value={createAuthMode}
+              onValueChange={(value) => {
+                if (!value) return;
+                handleCreateAuthModeChange(value as "apikey" | "oauth");
+              }}
+              className="provider-channel-group"
             >
-              {[...providerPresets]
-                .sort((a, b) => (a.id === DEFAULT_PRESET_ID ? -1 : b.id === DEFAULT_PRESET_ID ? 1 : 0))
-                .map((preset) => (
-                <ToggleGroupItem
-                  key={preset.id}
-                  value={preset.id}
-                  variant="outline"
-                  size="lg"
-                  className="provider-preset-card h-auto w-full flex-col gap-3 px-4 py-5"
-                  aria-label={presetLabel(preset, isZh)}
-                >
-                  {preset.icon === "nyro" ? (
-                    <>
-                      <NyroIcon
-                        size={26}
-                        className="provider-preset-icon provider-preset-icon-custom provider-preset-icon-colored"
-                      />
-                      <NyroIcon
-                        size={26}
-                        monochrome
-                        className="provider-preset-icon provider-preset-icon-custom provider-preset-icon-mono"
-                      />
-                    </>
-                  ) : (
-                    <>
-                      <ProviderIcon
-                        name={preset.icon ?? preset.label.en}
-                        size={26}
-                        className="provider-preset-icon provider-preset-icon-colored rounded-none border-0 bg-transparent"
-                      />
-                      <ProviderIcon
-                        name={preset.icon ?? preset.label.en}
-                        size={26}
-                        monochrome
-                        className="provider-preset-icon provider-preset-icon-mono rounded-none border-0 bg-transparent"
-                      />
-                    </>
-                  )}
-                  <span className={presetLabelClass(preset, isZh)}>{presetLabel(preset, isZh)}</span>
-                </ToggleGroupItem>
-              ))}
+              <ToggleGroupItem value="apikey" variant="outline" size="default" className="provider-preset-card provider-channel-item">
+                API Key
+              </ToggleGroupItem>
+              <ToggleGroupItem value="oauth" variant="outline" size="default" className="provider-preset-card provider-channel-item">
+                OAuth Account
+              </ToggleGroupItem>
             </ToggleGroup>
+          </div>
+          <div className="h-px bg-slate-200/70" />
+          <div className="space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-700">
+                {isZh ? "2. 快速选择供应商预设" : "2. Select Provider Preset"}
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                {isZh
+                  ? "不同认证方式展示不同预设；当前先恢复前端形态用于预览。"
+                  : "Presets are filtered by auth mode. This restores the front-end flow for preview first."}
+              </p>
+            </div>
+            {hasCreatePresets ? (
+              <ToggleGroup
+                type="single"
+                value={selectedPresetId}
+                onValueChange={handlePresetChange}
+                className="provider-preset-group"
+              >
+                {[...createPresetOptions]
+                  .sort(sortPresetForDisplay)
+                  .map((preset) => (
+                    <ToggleGroupItem
+                      key={preset.id}
+                      value={preset.id}
+                      variant="outline"
+                      size="lg"
+                      className="provider-preset-card h-auto w-full flex-col gap-3 px-4 py-5"
+                      aria-label={presetLabel(preset, isZh)}
+                    >
+                      {preset.icon === "nyro" ? (
+                        <>
+                          <NyroIcon
+                            size={26}
+                            className="provider-preset-icon provider-preset-icon-custom provider-preset-icon-colored"
+                          />
+                          <NyroIcon
+                            size={26}
+                            monochrome
+                            className="provider-preset-icon provider-preset-icon-custom provider-preset-icon-mono"
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <ProviderIcon
+                            name={preset.icon ?? preset.label.en}
+                            size={26}
+                            className="provider-preset-icon provider-preset-icon-colored rounded-none border-0 bg-transparent"
+                          />
+                          <ProviderIcon
+                            name={preset.icon ?? preset.label.en}
+                            size={26}
+                            monochrome
+                            className="provider-preset-icon provider-preset-icon-mono rounded-none border-0 bg-transparent"
+                          />
+                        </>
+                      )}
+                      <span className={presetLabelClass(preset, isZh)}>{presetLabel(preset, isZh)}</span>
+                    </ToggleGroupItem>
+                  ))}
+              </ToggleGroup>
+            ) : (
+              <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-sm text-slate-500">
+                {isZh
+                  ? "当前认证方式下没有可用预设。"
+                  : "No presets are available for this auth mode."}
+              </div>
+            )}
           </div>
           <div className="h-px bg-slate-200/70" />
           <div className="space-y-4">
             <div>
               <p className="text-sm font-semibold text-slate-700">
-                {isZh ? "2. 基础信息" : "2. Basic Information"}
+                {isZh ? "3. 基础信息" : "3. Basic Information"}
               </p>
               <p className="mt-1 text-xs text-slate-500">
                 {selectedPreset
@@ -960,6 +1346,7 @@ export default function ProvidersPage() {
                 <FieldLabel>{isZh ? "默认协议" : "Default Protocol"}</FieldLabel>
                 <Select
                   value={form.protocol}
+                  disabled={createAuthMode === "oauth"}
                   onValueChange={(value) => {
                     const nextProtocol = value as ProviderProtocol;
                     const config = selectedPreset
@@ -1007,6 +1394,7 @@ export default function ProvidersPage() {
                     <div key={`create-endpoint-${index}`} className="grid grid-cols-[180px_minmax(0,1fr)_32px] gap-2">
                       <Select
                         value={row.protocol}
+                        disabled={createAuthMode === "oauth"}
                         onValueChange={(value) => {
                           const nextProtocol = value as ProviderProtocol;
                           setCreateEndpointRows((prev) =>
@@ -1028,6 +1416,7 @@ export default function ProvidersPage() {
                       <Input
                         placeholder={isZh ? "输入上游基础地址" : "Enter upstream base URL"}
                         value={row.base_url}
+                        disabled={createAuthMode === "oauth"}
                         onChange={(e) =>
                           setCreateEndpointRows((prev) =>
                             prev.map((item, i) => (i === index ? { ...item, base_url: e.target.value } : item)),
@@ -1036,7 +1425,7 @@ export default function ProvidersPage() {
                       />
                       <button
                         type="button"
-                        disabled={createEndpointRows.length <= 1}
+                        disabled={createAuthMode === "oauth" || createEndpointRows.length <= 1}
                         onClick={() =>
                           setCreateEndpointRows((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== index)))
                         }
@@ -1050,6 +1439,7 @@ export default function ProvidersPage() {
                     type="button"
                     variant="secondary"
                     className="w-full"
+                    disabled={createAuthMode === "oauth"}
                     onClick={() =>
                       setCreateEndpointRows((prev) => [...prev, { protocol: "openai", base_url: "" }])
                     }
@@ -1079,26 +1469,153 @@ export default function ProvidersPage() {
                   </p>
                 )}
               </div>
-              <div className="space-y-2">
-                <FieldLabel>API Key</FieldLabel>
-                <div className="relative">
-                  <Input
-                    placeholder="sk-..."
-                    type={showCreateApiKey ? "text" : "password"}
-                    value={form.api_key}
-                    className="pr-10"
-                    onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowCreateApiKey((prev) => !prev)}
-                    className="absolute top-1/2 right-3 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
-                    aria-label={showCreateApiKey ? (isZh ? "隐藏 API Key" : "Hide API key") : (isZh ? "显示 API Key" : "Show API key")}
-                  >
-                    {showCreateApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
+              {createAuthMode === "apikey" ? (
+                <div className="space-y-2">
+                  <FieldLabel>API Key</FieldLabel>
+                  <div className="relative">
+                    <Input
+                      placeholder="sk-..."
+                      type={showCreateApiKey ? "text" : "password"}
+                      value={form.api_key}
+                      className="pr-10"
+                      onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowCreateApiKey((prev) => !prev)}
+                      className="absolute top-1/2 right-3 -translate-y-1/2 cursor-pointer text-slate-400 hover:text-slate-600"
+                      aria-label={showCreateApiKey ? (isZh ? "隐藏 API Key" : "Hide API key") : (isZh ? "显示 API Key" : "Show API key")}
+                    >
+                      {showCreateApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="col-span-2 space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800">
+                        {isZh ? "OAuth 授权状态" : "OAuth Authorization Status"}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {createOAuthRequiresManualCode
+                          ? (isZh
+                            ? "先打开授权页完成登录，再把浏览器回调地址或授权码粘贴回来。"
+                            : "Open the authorization page first, then paste the browser callback URL or authorization code here.")
+                          : (isZh
+                            ? "先在浏览器完成授权，状态变为 Ready 后才能保存 Provider。"
+                            : "Complete browser authorization first, then save the provider after status becomes Ready.")}
+                      </p>
+                    </div>
+                    <Badge variant={createOAuthStatus?.status === "ready" ? "success" : createOAuthStatus?.status === "error" ? "danger" : "secondary"}>
+                      {createOAuthBusy
+                        ? (isZh ? "授权中" : "Authorizing")
+                        : createOAuthStatus?.status === "ready"
+                          ? "Ready"
+                          : createOAuthStatus?.status === "error"
+                            ? "Error"
+                            : createOAuthStatus?.status === "pending"
+                              ? (isZh ? "等待确认" : "Pending")
+                              : "Idle"}
+                    </Badge>
+                  </div>
+                  {createOAuthSession ? (
+                    <div className="rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-sm text-slate-600">
+                      <span className="font-medium">{isZh ? "授权链接" : "Authorization URL"}:</span>{" "}
+                      <span className="break-all">{createOAuthSession.auth_url || createOAuthSession.verification_uri_complete}</span>
+                      {createOAuthSession.user_code ? (
+                        <>
+                          <span className="mx-2 text-slate-300">|</span>
+                          <span className="font-medium">{isZh ? "用户码" : "User code"}:</span>{" "}
+                          {createOAuthSession.user_code}
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset}>
+                      {createOAuthBusy ? (isZh ? "授权中..." : "Authorizing...") : (isZh ? "开始授权" : "Start Authorization")}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={cancelCreateOAuth}
+                      disabled={!createOAuthSession || createOAuthStatus?.status === "ready"}
+                    >
+                      {isZh ? "取消授权" : "Cancel"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      onClick={reopenCreateOAuthPage}
+                      disabled={!createOAuthSession}
+                    >
+                      {isZh ? "重新打开授权页" : "Reopen Authorization Page"}
+                    </Button>
+                  </div>
+                  {createOAuthRequiresManualCode ? (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div className="space-y-2 md:col-span-2">
+                        <FieldLabel
+                          info={isZh ? "推荐直接粘贴浏览器地址栏里的完整回调 URL。" : "Recommended: paste the full callback URL from the browser address bar."}
+                        >
+                          {isZh ? "回调地址" : "Callback URL"}
+                        </FieldLabel>
+                        <Input
+                          placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
+                          value={createOAuthCallbackUrl}
+                          onChange={(e) => setCreateOAuthCallbackUrl(e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <FieldLabel
+                          info={isZh ? "如果没有完整回调地址，也可以只粘贴 code 参数。" : "If you do not have the full callback URL, you can paste only the code value."}
+                        >
+                          {isZh ? "授权码" : "Authorization Code"}
+                        </FieldLabel>
+                        <Input
+                          placeholder="code..."
+                          value={createOAuthCode}
+                          onChange={(e) => setCreateOAuthCode(e.target.value)}
+                        />
+                      </div>
+                      <div className="flex items-end">
+                        <Button
+                          type="button"
+                          onClick={completeCreateOAuth}
+                          disabled={createOAuthBusy || !createOAuthSession}
+                          className="w-full"
+                        >
+                          {createOAuthBusy ? (isZh ? "提交中..." : "Submitting...") : (isZh ? "提交授权结果" : "Submit Authorization")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="text-xs">
+                    {createOAuthStatus?.status === "ready" ? (
+                      <p className="text-emerald-600">
+                        {isZh ? "授权完成，可保存 Provider。" : "Authorization completed. You can now save this provider."}
+                      </p>
+                    ) : createOAuthStatus?.status === "error" ? (
+                      <p className="text-rose-600">
+                        {createOAuthStatus.code}: {createOAuthStatus.message}
+                      </p>
+                    ) : createOAuthStatus?.status === "pending" || createOAuthBusy ? (
+                      <p className="text-amber-600">
+                        {createOAuthRequiresManualCode
+                          ? (isZh ? "完成浏览器授权后，把回调地址或 code 粘贴回来。" : "After browser authorization, paste the callback URL or code here.")
+                          : (isZh ? "授权进行中，请在浏览器确认。" : "Authorization in progress, please confirm in browser.")}
+                      </p>
+                    ) : (
+                      <p className="text-slate-500">
+                        {createOAuthRequiresManualCode
+                          ? (isZh ? "点击开始授权，完成浏览器登录后再提交回调结果。" : "Click Start Authorization, then submit the callback result after browser login.")
+                          : (isZh ? "点击开始授权，完成后即可保存。" : "Click Start Authorization, then save after completion.")}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
               <div className="space-y-2">
                 <FieldLabel
                   info={
@@ -1112,6 +1629,7 @@ export default function ProvidersPage() {
                 <Input
                   placeholder={isZh ? "可选，支持 https:// 或 ai://models.dev/..." : "Optional, supports https:// or ai://models.dev/..."}
                   value={form.models_source ?? ""}
+                  disabled={createAuthMode === "oauth"}
                   onChange={(e) => setForm({ ...form, models_source: e.target.value })}
                 />
               </div>
@@ -1128,11 +1646,12 @@ export default function ProvidersPage() {
                 <Input
                   placeholder={isZh ? "可选，支持 https:// 或 ai://models.dev/..." : "Optional, supports https:// or ai://models.dev/..."}
                   value={form.capabilities_source ?? ""}
+                  disabled={createAuthMode === "oauth"}
                   onChange={(e) => setForm({ ...form, capabilities_source: e.target.value })}
                 />
               </div>
             </div>
-            <div className="flex gap-3">
+              <div className="flex gap-3">
                 <Button
                   onClick={() => {
                     const protocol = form.protocol || "openai";
@@ -1146,18 +1665,33 @@ export default function ProvidersPage() {
                     }
                     const endpoints = buildProtocolEndpointsFromRows(createEndpointRows);
                     const baseUrl = endpoints[protocol]?.base_url ?? form.base_url ?? "";
-                    createMut.mutate({
+                    const input: CreateProvider = {
                       ...form,
                       protocol,
                       base_url: baseUrl,
                       default_protocol: protocol,
                       protocol_endpoints: JSON.stringify(endpoints),
-                    });
+                    };
+                    if (createAuthMode === "oauth") {
+                      const sessionId = createOAuthSession?.session_id;
+                      if (!sessionId) return;
+                      createOAuthMut.mutate({ sessionId, input });
+                      return;
+                    }
+                    createMut.mutate(input);
                   }}
-                  disabled={createMut.isPending || !form.name || !form.api_key}
+                  disabled={
+                    createMut.isPending
+                    || createOAuthMut.isPending
+                    || !form.name.trim()
+                    || (createAuthMode === "apikey" && !form.api_key)
+                    || (createAuthMode === "oauth" && !createOAuthReady)
+                  }
                 >
-                {createMut.isPending ? (isZh ? "创建中..." : "Creating...") : (isZh ? "创建" : "Create")}
-              </Button>
+                  {(createMut.isPending || createOAuthMut.isPending)
+                    ? (isZh ? "创建中..." : "Creating...")
+                    : (isZh ? "创建" : "Create")}
+                </Button>
               <Button
                 onClick={closeCreateForm}
                 variant="secondary"

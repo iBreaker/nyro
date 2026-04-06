@@ -87,10 +87,22 @@ def wait_until_ready(url: str, headers: dict[str, str], timeout_sec: float = 30.
 
 class MockProviderHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    request_log: list[dict[str, Any]] = []
+    request_log_lock = threading.Lock()
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
         # Keep smoke output clean.
         return
+
+    @classmethod
+    def reset_requests(cls) -> None:
+        with cls.request_log_lock:
+            cls.request_log.clear()
+
+    @classmethod
+    def snapshot_requests(cls) -> list[dict[str, Any]]:
+        with cls.request_log_lock:
+            return list(cls.request_log)
 
     def _read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("content-length", "0"))
@@ -134,10 +146,20 @@ class MockProviderHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         body = self._read_json_body()
         path = urlsplit(self.path).path
+        with self.request_log_lock:
+            self.request_log.append(
+                {
+                    "path": path,
+                    "raw_path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": body,
+                }
+            )
 
         # OpenAI upstream mock
         if path == "/v1/chat/completions":
             model = str(body.get("model", "mock-openai-model"))
+            messages = body.get("messages") or []
             if body.get("stream"):
                 self._write_sse(
                     [
@@ -180,6 +202,57 @@ class MockProviderHandler(BaseHTTPRequestHandler):
                         ),
                         (None, "[DONE]"),
                     ]
+                )
+                return
+
+            if any(msg.get("role") == "tool" for msg in messages if isinstance(msg, dict)):
+                self._write_json(
+                    200,
+                    {
+                        "id": "chatcmpl-mock-tool-result",
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "mock-tool-result"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 19, "completion_tokens": 5, "total_tokens": 24},
+                    },
+                )
+                return
+
+            if body.get("tools"):
+                self._write_json(
+                    200,
+                    {
+                        "id": "chatcmpl-mock-tool-call",
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_mock_weather",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "get_weather",
+                                                "arguments": json.dumps({"city": "Hangzhou"}),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 17, "completion_tokens": 6, "total_tokens": 23},
+                    },
                 )
                 return
 
@@ -474,6 +547,121 @@ def run_smoke() -> None:
             assert_true("[DONE]" in stream_text_s, "openai stream missing [DONE]")
             assert_true("mock-" in stream_text_s and "stream" in stream_text_s, "openai stream missing text deltas")
 
+            # OpenAI Responses non-stream
+            MockProviderHandler.reset_requests()
+            status, resp = http_request(
+                "POST",
+                f"{proxy_base}/v1/responses",
+                payload={"model": "nyro-chat", "input": "hello from responses"},
+                headers=proxy_headers,
+            )
+            assert_true(status == 200, f"responses non-stream failed: {status} {resp}")
+            assert_true(resp["object"] == "response", f"unexpected responses object: {resp}")
+            assert_true(resp["output_text"] == "mock-openai", f"unexpected responses text: {resp}")
+            requests = MockProviderHandler.snapshot_requests()
+            assert_true(len(requests) == 1, f"expected 1 upstream request for responses, got {len(requests)}")
+            upstream_req = requests[0]
+            assert_true(
+                upstream_req["path"] == "/v1/chat/completions",
+                f"responses upstream path mismatch: {upstream_req['path']}",
+            )
+            assert_true(
+                upstream_req["body"].get("model") == "gpt-mock",
+                f"responses upstream model mismatch: {upstream_req['body']}",
+            )
+
+            # OpenAI Responses stream
+            MockProviderHandler.reset_requests()
+            status, resp_stream = http_request(
+                "POST",
+                f"{proxy_base}/v1/responses",
+                payload={"model": "nyro-chat", "stream": True, "input": "hello from responses"},
+                headers=proxy_headers,
+                timeout=15.0,
+            )
+            assert_true(status == 200, f"responses stream failed: {status} {resp_stream}")
+            resp_stream_text = str(resp_stream)
+            assert_true(
+                "event: response.output_text.delta" in resp_stream_text,
+                "responses stream missing output_text.delta",
+            )
+            assert_true("event: response.completed" in resp_stream_text, "responses stream missing completed")
+            assert_true("[DONE]" in resp_stream_text, "responses stream missing [DONE]")
+
+            # OpenAI Responses tool call round-trip
+            MockProviderHandler.reset_requests()
+            status, tool_resp = http_request(
+                "POST",
+                f"{proxy_base}/v1/responses",
+                payload={
+                    "model": "nyro-chat",
+                    "input": "check weather",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "description": "Get current weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        }
+                    ],
+                },
+                headers=proxy_headers,
+            )
+            assert_true(status == 200, f"responses tool call failed: {status} {tool_resp}")
+            tool_items = [item for item in tool_resp["output"] if item.get("type") == "function_call"]
+            assert_true(len(tool_items) == 1, f"expected one function_call item, got {tool_resp}")
+            tool_item = tool_items[0]
+            assert_true(tool_item["name"] == "get_weather", f"unexpected tool name: {tool_item}")
+            requests = MockProviderHandler.snapshot_requests()
+            assert_true(len(requests) == 1, f"expected one upstream tool request, got {len(requests)}")
+            upstream_tool_req = requests[0]["body"]
+            assert_true(upstream_tool_req.get("model") == "gpt-mock", f"tool request model mismatch: {upstream_tool_req}")
+            upstream_tools = upstream_tool_req.get("tools") or []
+            assert_true(len(upstream_tools) == 1, f"expected one upstream tool def, got {upstream_tool_req}")
+            assert_true(
+                upstream_tools[0].get("function", {}).get("name") == "get_weather",
+                f"upstream tool name mismatch: {upstream_tools}",
+            )
+
+            MockProviderHandler.reset_requests()
+            status, tool_result_resp = http_request(
+                "POST",
+                f"{proxy_base}/v1/responses",
+                payload={
+                    "model": "nyro-chat",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "check weather"}],
+                        },
+                        tool_item,
+                        {
+                            "type": "function_call_output",
+                            "call_id": tool_item["call_id"],
+                            "output": json.dumps({"city": "Hangzhou", "temp_c": 23}),
+                        },
+                    ],
+                },
+                headers=proxy_headers,
+            )
+            assert_true(status == 200, f"responses tool result failed: {status} {tool_result_resp}")
+            assert_true(
+                tool_result_resp["output_text"] == "mock-tool-result",
+                f"unexpected tool result response: {tool_result_resp}",
+            )
+            requests = MockProviderHandler.snapshot_requests()
+            assert_true(len(requests) == 1, f"expected one upstream tool result request, got {len(requests)}")
+            upstream_messages = requests[0]["body"].get("messages") or []
+            assert_true(
+                any(msg.get("role") == "tool" for msg in upstream_messages if isinstance(msg, dict)),
+                f"upstream tool result message missing tool role: {upstream_messages}",
+            )
+
             # Anthropic stream
             status, anth_stream = http_request(
                 "POST",
@@ -539,7 +727,9 @@ def run_smoke() -> None:
                 time.sleep(0.3)
             assert_true(total_logs >= 3, f"expected log entries after traffic, got {total_logs}")
 
-            print("Smoke test passed: admin auth + route API key auth + OpenAI/Anthropic/Gemini flows")
+            print(
+                "Smoke test passed: admin auth + route API key auth + OpenAI/Responses/Anthropic/Gemini flows"
+            )
 
     finally:
         if proc is not None and proc.poll() is None:

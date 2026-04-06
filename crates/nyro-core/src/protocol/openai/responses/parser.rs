@@ -36,8 +36,7 @@ impl ResponseParser for ResponsesResponseParser {
                                     block.get("type").and_then(|v| v.as_str()),
                                     Some("output_text" | "text")
                                 ) {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                         content.push_str(text);
                                     }
                                 }

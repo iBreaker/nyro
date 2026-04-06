@@ -66,7 +66,7 @@ function strategyLabel(value: RouteStrategy, isZh: boolean) {
 }
 
 function hasProviderModelsEndpoint(provider?: Provider) {
-  return Boolean(provider?.models_source?.trim());
+  return Boolean(provider?.models_source?.trim() || provider?.static_models?.trim());
 }
 
 function withCurrentModel(options: string[], current?: string) {

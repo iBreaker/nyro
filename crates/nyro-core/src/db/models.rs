@@ -395,7 +395,9 @@ impl Provider {
     /// Falls back to building a single-entry map from legacy `protocol`/`base_url`.
     pub fn parsed_protocol_endpoints(&self) -> HashMap<String, ProtocolEndpointEntry> {
         if !self.protocol_endpoints.trim().is_empty() && self.protocol_endpoints.trim() != "{}" {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, ProtocolEndpointEntry>>(&self.protocol_endpoints) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, ProtocolEndpointEntry>>(
+                &self.protocol_endpoints,
+            ) {
                 if !map.is_empty() {
                     return map;
                 }

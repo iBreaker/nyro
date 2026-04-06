@@ -2,9 +2,9 @@ pub mod models;
 
 use std::path::Path;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 pub async fn init_pool(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     std::fs::create_dir_all(data_dir)?;
@@ -52,7 +52,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 async fn backfill_provider_vendor(pool: &SqlitePool) -> anyhow::Result<()> {
-    if column_exists(pool, "providers", "vendor").await? && column_exists(pool, "providers", "preset_key").await? {
+    if column_exists(pool, "providers", "vendor").await?
+        && column_exists(pool, "providers", "preset_key").await?
+    {
         sqlx::query(
             "UPDATE providers \
              SET vendor = lower(trim(preset_key)) \
@@ -178,9 +180,11 @@ async fn ensure_api_key_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key)")
         .execute(pool)
         .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_key_routes_route_id ON api_key_routes(route_id)")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_api_key_routes_route_id ON api_key_routes(route_id)",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -238,12 +242,18 @@ async fn backfill_route_targets(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn column_exists(pool: &SqlitePool, table_name: &str, column_name: &str) -> anyhow::Result<bool> {
+async fn column_exists(
+    pool: &SqlitePool,
+    table_name: &str,
+    column_name: &str,
+) -> anyhow::Result<bool> {
     let pragma = format!("PRAGMA table_info({table_name})");
     let rows = sqlx::query(&pragma).fetch_all(pool).await?;
-    Ok(rows
-        .iter()
-        .any(|row| row.try_get::<String, _>("name").map(|name| name == column_name).unwrap_or(false)))
+    Ok(rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .map(|name| name == column_name)
+            .unwrap_or(false)
+    }))
 }
 
 const INIT_SQL: &str = r#"
@@ -322,4 +332,49 @@ CREATE TABLE IF NOT EXISTS settings (
     value      TEXT NOT NULL,
     updated_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id                         TEXT PRIMARY KEY,
+    provider_id                TEXT REFERENCES providers(id) ON DELETE CASCADE,
+    driver_key                 TEXT NOT NULL,
+    scheme                     TEXT NOT NULL,
+    status                     TEXT NOT NULL,
+    use_proxy                  INTEGER DEFAULT 0,
+    user_code                  TEXT,
+    verification_uri           TEXT,
+    verification_uri_complete  TEXT,
+    state_json                 TEXT,
+    context_json               TEXT,
+    result_json                TEXT,
+    expires_at                 TEXT,
+    poll_interval_seconds      INTEGER,
+    last_error                 TEXT,
+    created_at                 TEXT DEFAULT (datetime('now')),
+    updated_at                 TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_provider_id ON auth_sessions(provider_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
+
+CREATE TABLE IF NOT EXISTS provider_auth_bindings (
+    id             TEXT PRIMARY KEY,
+    provider_id    TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    driver_key     TEXT NOT NULL,
+    scheme         TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    access_token   TEXT,
+    refresh_token  TEXT,
+    expires_at     TEXT,
+    resource_url   TEXT,
+    subject_id     TEXT,
+    scopes_json    TEXT,
+    meta_json      TEXT,
+    last_error     TEXT,
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now')),
+    UNIQUE(provider_id, driver_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_auth_bindings_provider_id
+    ON provider_auth_bindings(provider_id);
 "#;

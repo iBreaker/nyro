@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use sqlx::{MySql, Pool};
 
+use crate::auth::types::{
+    AuthSession, CreateAuthSession, ProviderAuthBinding, UpdateAuthSession,
+    UpsertProviderAuthBinding,
+};
 use crate::db::models::{
     ApiKey, ApiKeyWithBindings, CreateApiKey, CreateProvider, CreateRoute, CreateRouteTarget,
     LogPage, LogQuery, ModelStats, Provider, ProviderStats, RequestLog, Route, RouteTarget,
@@ -14,9 +18,10 @@ use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::dialect::SqlDialect;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, DynStorage, LogStore, ProviderStore,
-    ProviderTestResult, RouteSnapshotStore, RouteStore, RouteTargetStore, SettingsStore, Storage,
-    StorageBackend, StorageBootstrap, StorageHealth, UsageWindow,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, AuthSessionStore, DynStorage, LogStore,
+    ProviderAuthBindingStore, ProviderStore, ProviderTestResult, RouteSnapshotStore, RouteStore,
+    RouteTargetStore, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
+    UsageWindow,
 };
 
 #[derive(Clone)]
@@ -33,9 +38,10 @@ pub struct MySqlHealth {
 
 impl MySqlAdapter {
     pub async fn connect(config: SqlBackendConfig) -> anyhow::Result<Self> {
-        let pool = RelationalPool::connect(crate::storage::sql::config::SqlBackendKind::MySql, &config)
-            .await
-            .context("connect mysql adapter")?;
+        let pool =
+            RelationalPool::connect(crate::storage::sql::config::SqlBackendKind::MySql, &config)
+                .await
+                .context("connect mysql adapter")?;
         let pool = pool
             .as_mysql()
             .cloned()
@@ -76,6 +82,8 @@ pub struct MySqlStorage {
     route_target_store: Arc<MySqlRouteTargetStore>,
     settings_store: Arc<MySqlSettingsStore>,
     api_key_store: Arc<MySqlApiKeyStore>,
+    auth_session_store: Arc<MySqlAuthSessionStore>,
+    provider_auth_binding_store: Arc<MySqlProviderAuthBindingStore>,
     auth_store: Arc<MySqlAuthAccessStore>,
     log_store: Arc<MySqlLogStore>,
     bootstrap: Arc<MySqlBootstrap>,
@@ -99,6 +107,12 @@ impl MySqlStorage {
         let api_key_store = Arc::new(MySqlApiKeyStore {
             pool: adapter.pool().clone(),
         });
+        let auth_session_store = Arc::new(MySqlAuthSessionStore {
+            pool: adapter.pool().clone(),
+        });
+        let provider_auth_binding_store = Arc::new(MySqlProviderAuthBindingStore {
+            pool: adapter.pool().clone(),
+        });
         let auth_store = Arc::new(MySqlAuthAccessStore {
             pool: adapter.pool().clone(),
         });
@@ -112,6 +126,8 @@ impl MySqlStorage {
             route_target_store,
             settings_store,
             api_key_store,
+            auth_session_store,
+            provider_auth_binding_store,
             auth_store,
             log_store,
             bootstrap,
@@ -144,6 +160,14 @@ impl Storage for MySqlStorage {
         Some(self.api_key_store.as_ref())
     }
 
+    fn auth_sessions(&self) -> Option<&dyn AuthSessionStore> {
+        Some(self.auth_session_store.as_ref())
+    }
+
+    fn provider_auth_bindings(&self) -> Option<&dyn ProviderAuthBindingStore> {
+        Some(self.provider_auth_binding_store.as_ref())
+    }
+
     fn auth(&self) -> Option<&dyn AuthAccessStore> {
         Some(self.auth_store.as_ref())
     }
@@ -162,6 +186,16 @@ struct MySqlProviderStore {
     pool: Pool<MySql>,
 }
 
+#[derive(Clone)]
+struct MySqlAuthSessionStore {
+    pool: Pool<MySql>,
+}
+
+#[derive(Clone)]
+struct MySqlProviderAuthBindingStore {
+    pool: Pool<MySql>,
+}
+
 #[async_trait]
 impl ProviderStore for MySqlProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
@@ -171,10 +205,12 @@ impl ProviderStore for MySqlProviderStore {
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
-        Ok(sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = ?")))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = ?")))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     async fn create(&self, input: CreateProvider) -> anyhow::Result<Provider> {
@@ -205,11 +241,16 @@ impl ProviderStore for MySqlProviderStore {
         .bind(input.use_proxy)
         .execute(&self.pool)
         .await?;
-        self.get(&id).await?.context("provider missing after create")
+        self.get(&id)
+            .await?
+            .context("provider missing after create")
     }
 
     async fn update(&self, id: &str, input: UpdateProvider) -> anyhow::Result<Provider> {
-        let current = self.get(id).await?.context("provider not found for update")?;
+        let current = self
+            .get(id)
+            .await?
+            .context("provider not found for update")?;
         let models_source_input = input.effective_models_source().map(ToString::to_string);
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -217,13 +258,10 @@ impl ProviderStore for MySqlProviderStore {
         } else {
             normalize_provider_vendor(current.vendor.as_deref())
         };
-        let models_source = models_source_input
-            .or_else(|| current.models_source.clone());
+        let models_source = models_source_input.or_else(|| current.models_source.clone());
         let protocol = input.protocol.unwrap_or(current.protocol.clone());
         let base_url = input.base_url.unwrap_or(current.base_url);
-        let default_protocol = input
-            .default_protocol
-            .unwrap_or(current.default_protocol);
+        let default_protocol = input.default_protocol.unwrap_or(current.default_protocol);
         let protocol_endpoints = input
             .protocol_endpoints
             .unwrap_or(current.protocol_endpoints);
@@ -286,7 +324,11 @@ impl ProviderStore for MySqlProviderStore {
         Ok(row.is_some())
     }
 
-    async fn record_test_result(&self, provider_id: &str, result: ProviderTestResult) -> anyhow::Result<()> {
+    async fn record_test_result(
+        &self,
+        provider_id: &str,
+        result: ProviderTestResult,
+    ) -> anyhow::Result<()> {
         let _ = result.tested_at;
         sqlx::query(
             "UPDATE providers SET last_test_success = ?, last_test_at = UTC_TIMESTAMP() WHERE id = ?",
@@ -299,6 +341,177 @@ impl ProviderStore for MySqlProviderStore {
     }
 }
 
+#[async_trait]
+impl AuthSessionStore for MySqlAuthSessionStore {
+    async fn list(&self) -> anyhow::Result<Vec<AuthSession>> {
+        Ok(sqlx::query_as::<_, AuthSession>(&auth_session_select(None))
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn get(&self, id: &str) -> anyhow::Result<Option<AuthSession>> {
+        Ok(
+            sqlx::query_as::<_, AuthSession>(&auth_session_select(Some("WHERE id = ?")))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn create(&self, input: CreateAuthSession) -> anyhow::Result<AuthSession> {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO auth_sessions (id, provider_id, driver_key, scheme, status, use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, expires_at, poll_interval_seconds, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())",
+        )
+        .bind(&id)
+        .bind(input.provider_id)
+        .bind(input.driver_key)
+        .bind(input.scheme)
+        .bind(input.status)
+        .bind(input.use_proxy)
+        .bind(input.user_code)
+        .bind(input.verification_uri)
+        .bind(input.verification_uri_complete)
+        .bind(input.state_json)
+        .bind(input.context_json)
+        .bind(input.result_json)
+        .bind(input.expires_at)
+        .bind(input.poll_interval_seconds)
+        .bind(input.last_error)
+        .execute(&self.pool)
+        .await?;
+        self.get(&id)
+            .await?
+            .context("auth session missing after create")
+    }
+
+    async fn update(&self, id: &str, input: UpdateAuthSession) -> anyhow::Result<AuthSession> {
+        let current = self
+            .get(id)
+            .await?
+            .context("auth session not found for update")?;
+        sqlx::query(
+            "UPDATE auth_sessions SET status=?, user_code=?, verification_uri=?, verification_uri_complete=?, state_json=?, context_json=?, result_json=?, expires_at=?, poll_interval_seconds=?, last_error=?, updated_at=UTC_TIMESTAMP() WHERE id=?",
+        )
+        .bind(input.status.unwrap_or(current.status))
+        .bind(input.user_code.or(current.user_code))
+        .bind(input.verification_uri.or(current.verification_uri))
+        .bind(input.verification_uri_complete.or(current.verification_uri_complete))
+        .bind(input.state_json.or(current.state_json))
+        .bind(input.context_json.or(current.context_json))
+        .bind(input.result_json.or(current.result_json))
+        .bind(input.expires_at.or(current.expires_at))
+        .bind(input.poll_interval_seconds.or(current.poll_interval_seconds))
+        .bind(input.last_error.or(current.last_error))
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        self.get(id)
+            .await?
+            .context("auth session missing after update")
+    }
+
+    async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM auth_sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM auth_sessions WHERE expires_at IS NOT NULL AND TRIM(expires_at) != '' AND expires_at <= UTC_TIMESTAMP()",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[async_trait]
+impl ProviderAuthBindingStore for MySqlProviderAuthBindingStore {
+    async fn list_by_provider(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = ?",
+            )))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn get_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<Option<ProviderAuthBinding>> {
+        Ok(
+            sqlx::query_as::<_, ProviderAuthBinding>(&provider_auth_binding_select(Some(
+                "WHERE provider_id = ? AND driver_key = ?",
+            )))
+            .bind(provider_id)
+            .bind(driver_key)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    async fn upsert(
+        &self,
+        input: UpsertProviderAuthBinding,
+    ) -> anyhow::Result<ProviderAuthBinding> {
+        let id = if let Some(existing) = self
+            .get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+        {
+            existing.id
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+
+        sqlx::query(
+            "INSERT INTO provider_auth_bindings (id, provider_id, driver_key, scheme, status, access_token, refresh_token, expires_at, resource_url, subject_id, scopes_json, meta_json, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE scheme=VALUES(scheme), status=VALUES(status), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), resource_url=VALUES(resource_url), subject_id=VALUES(subject_id), scopes_json=VALUES(scopes_json), meta_json=VALUES(meta_json), last_error=VALUES(last_error), updated_at=UTC_TIMESTAMP()",
+        )
+        .bind(&id)
+        .bind(&input.provider_id)
+        .bind(&input.driver_key)
+        .bind(input.scheme)
+        .bind(input.status)
+        .bind(input.access_token)
+        .bind(input.refresh_token)
+        .bind(input.expires_at)
+        .bind(input.resource_url)
+        .bind(input.subject_id)
+        .bind(input.scopes_json)
+        .bind(input.meta_json)
+        .bind(input.last_error)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_by_provider_and_driver(&input.provider_id, &input.driver_key)
+            .await?
+            .context("provider auth binding missing after upsert")
+    }
+
+    async fn delete_by_provider_and_driver(
+        &self,
+        provider_id: &str,
+        driver_key: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM provider_auth_bindings WHERE provider_id = ? AND driver_key = ?")
+            .bind(provider_id)
+            .bind(driver_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct MySqlRouteStore {
     pool: Pool<MySql>,
@@ -307,9 +520,11 @@ struct MySqlRouteStore {
 #[async_trait]
 impl RouteStore for MySqlRouteStore {
     async fn list(&self) -> anyhow::Result<Vec<Route>> {
-        Ok(sqlx::query_as::<_, Route>(&route_select(Some("ORDER BY created_at DESC")))
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, Route>(&route_select(Some("ORDER BY created_at DESC")))
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Route>> {
@@ -411,16 +626,13 @@ impl RouteStore for MySqlRouteStore {
             .fetch_optional(&self.pool)
             .await?
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM routes WHERE virtual_model = ? LIMIT 1",
-            )
-            .bind(normalized_model)
-            .fetch_optional(&self.pool)
-            .await?
+            sqlx::query_scalar::<_, String>("SELECT id FROM routes WHERE virtual_model = ? LIMIT 1")
+                .bind(normalized_model)
+                .fetch_optional(&self.pool)
+                .await?
         };
         Ok(row.is_some())
     }
-
 }
 
 #[async_trait]
@@ -515,9 +727,11 @@ impl SettingsStore for MySqlSettingsStore {
     }
 
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
-        Ok(sqlx::query_as::<_, (String, String)>("SELECT `key`, value FROM settings")
-            .fetch_all(&self.pool)
-            .await?)
+        Ok(
+            sqlx::query_as::<_, (String, String)>("SELECT `key`, value FROM settings")
+                .fetch_all(&self.pool)
+                .await?,
+        )
     }
 }
 
@@ -661,15 +875,17 @@ impl AuthAccessStore for MySqlAuthAccessStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(id, status, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
-            id,
-            status,
-            expires_at,
-            rpm,
-            rpd,
-            tpm,
-            tpd,
-        }))
+        Ok(row.map(
+            |(id, status, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
+                id,
+                status,
+                expires_at,
+                rpm,
+                rpd,
+                tpm,
+                tpd,
+            },
+        ))
     }
 
     async fn route_binding_exists(&self, api_key_id: &str, route_id: &str) -> anyhow::Result<bool> {
@@ -683,7 +899,11 @@ impl AuthAccessStore for MySqlAuthAccessStore {
         Ok(count > 0)
     }
 
-    async fn request_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn request_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let sql = format!(
             "SELECT COUNT(*) FROM request_logs WHERE api_key_id = ? AND created_at >= DATE_SUB(UTC_TIMESTAMP(), {})",
             usage_window_interval(window)
@@ -694,7 +914,11 @@ impl AuthAccessStore for MySqlAuthAccessStore {
             .await?)
     }
 
-    async fn token_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64> {
+    async fn token_count_since(
+        &self,
+        api_key_id: &str,
+        window: UsageWindow,
+    ) -> anyhow::Result<i64> {
         let sql = format!(
             "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM request_logs WHERE api_key_id = ? AND created_at >= DATE_SUB(UTC_TIMESTAMP(), {})",
             usage_window_interval(window)
@@ -875,15 +1099,21 @@ impl StorageBootstrap for MySqlBootstrap {
         let _ = sqlx::query("ALTER TABLE routes ADD COLUMN strategy VARCHAR(32) NULL")
             .execute(self.adapter.pool())
             .await;
-        let _ = sqlx::query("ALTER TABLE providers ADD COLUMN use_proxy BOOLEAN NOT NULL DEFAULT FALSE")
-            .execute(self.adapter.pool())
-            .await;
-        let _ = sqlx::query("ALTER TABLE providers ADD COLUMN default_protocol VARCHAR(64) NOT NULL DEFAULT ''")
-            .execute(self.adapter.pool())
-            .await;
-        let _ = sqlx::query("ALTER TABLE providers ADD COLUMN protocol_endpoints LONGTEXT NOT NULL DEFAULT '{}'")
-            .execute(self.adapter.pool())
-            .await;
+        let _ = sqlx::query(
+            "ALTER TABLE providers ADD COLUMN use_proxy BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(self.adapter.pool())
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE providers ADD COLUMN default_protocol VARCHAR(64) NOT NULL DEFAULT ''",
+        )
+        .execute(self.adapter.pool())
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE providers ADD COLUMN protocol_endpoints LONGTEXT NOT NULL DEFAULT '{}'",
+        )
+        .execute(self.adapter.pool())
+        .await;
         let _ = sqlx::query(
             "UPDATE providers SET default_protocol = protocol WHERE (default_protocol IS NULL OR TRIM(default_protocol) = '') AND protocol IS NOT NULL AND TRIM(protocol) != ''",
         )
@@ -894,9 +1124,11 @@ impl StorageBootstrap for MySqlBootstrap {
         )
         .execute(self.adapter.pool())
         .await;
-        sqlx::query("UPDATE routes SET strategy = 'weighted' WHERE strategy IS NULL OR TRIM(strategy) = ''")
-            .execute(self.adapter.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE routes SET strategy = 'weighted' WHERE strategy IS NULL OR TRIM(strategy) = ''",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         sqlx::query(
             r#"
             INSERT INTO route_targets (id, route_id, provider_id, model, weight, priority, created_at)
@@ -921,7 +1153,6 @@ impl StorageBootstrap for MySqlBootstrap {
             writable: health.can_connect,
         })
     }
-
 }
 
 fn provider_select(suffix: Option<&str>) -> String {
@@ -986,7 +1217,10 @@ fn normalize_provider_vendor(vendor: Option<&str>) -> Option<String> {
 }
 
 fn normalize_optional_datetime(value: Option<&str>) -> Option<String> {
-    value.map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 fn usage_window_interval(window: UsageWindow) -> &'static str {
@@ -1027,7 +1261,10 @@ fn is_ignorable_mysql_migration_error(error: &sqlx::Error) -> bool {
     }
 }
 
-async fn list_api_key_route_ids(pool: &Pool<MySql>, api_key_id: &str) -> anyhow::Result<Vec<String>> {
+async fn list_api_key_route_ids(
+    pool: &Pool<MySql>,
+    api_key_id: &str,
+) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         "SELECT route_id FROM api_key_routes WHERE api_key_id = ? ORDER BY route_id ASC",
     )
@@ -1059,6 +1296,30 @@ async fn replace_api_key_routes(
 
     tx.commit().await?;
     Ok(())
+}
+
+fn auth_session_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, use_proxy, user_code, verification_uri, verification_uri_complete, state_json, context_json, result_json, CAST(expires_at AS CHAR) AS expires_at, poll_interval_seconds, last_error, CAST(created_at AS CHAR) AS created_at, CAST(updated_at AS CHAR) AS updated_at FROM auth_sessions",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
+}
+
+fn provider_auth_binding_select(where_clause: Option<&str>) -> String {
+    let mut sql = String::from(
+        "SELECT id, provider_id, driver_key, scheme, status, access_token, refresh_token, CAST(expires_at AS CHAR) AS expires_at, resource_url, subject_id, scopes_json, meta_json, last_error, CAST(created_at AS CHAR) AS created_at, CAST(updated_at AS CHAR) AS updated_at FROM provider_auth_bindings",
+    );
+    if let Some(clause) = where_clause {
+        sql.push(' ');
+        sql.push_str(clause);
+    }
+    sql.push_str(" ORDER BY created_at DESC");
+    sql
 }
 
 const MYSQL_INIT_SQL: &str = r#"
@@ -1165,4 +1426,50 @@ CREATE TABLE IF NOT EXISTS api_key_routes (
 
 CREATE INDEX idx_api_keys_key ON api_keys(`key`);
 CREATE INDEX idx_api_key_routes_route_id ON api_key_routes(route_id);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id VARCHAR(64) PRIMARY KEY,
+    provider_id VARCHAR(64) NULL,
+    driver_key VARCHAR(128) NOT NULL,
+    scheme VARCHAR(64) NOT NULL,
+    status VARCHAR(64) NOT NULL,
+    use_proxy BOOLEAN NOT NULL DEFAULT FALSE,
+    user_code TEXT NULL,
+    verification_uri TEXT NULL,
+    verification_uri_complete TEXT NULL,
+    state_json LONGTEXT NULL,
+    context_json LONGTEXT NULL,
+    result_json LONGTEXT NULL,
+    expires_at DATETIME NULL,
+    poll_interval_seconds INT NULL,
+    last_error TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_auth_sessions_provider FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE INDEX idx_auth_sessions_provider_id ON auth_sessions(provider_id);
+CREATE INDEX idx_auth_sessions_status ON auth_sessions(status);
+
+CREATE TABLE IF NOT EXISTS provider_auth_bindings (
+    id VARCHAR(64) PRIMARY KEY,
+    provider_id VARCHAR(64) NOT NULL,
+    driver_key VARCHAR(128) NOT NULL,
+    scheme VARCHAR(64) NOT NULL,
+    status VARCHAR(64) NOT NULL,
+    access_token LONGTEXT NULL,
+    refresh_token LONGTEXT NULL,
+    expires_at DATETIME NULL,
+    resource_url TEXT NULL,
+    subject_id VARCHAR(255) NULL,
+    scopes_json LONGTEXT NULL,
+    meta_json LONGTEXT NULL,
+    last_error TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_provider_auth_bindings_provider_driver (provider_id, driver_key),
+    CONSTRAINT fk_provider_auth_bindings_provider FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE INDEX idx_provider_auth_bindings_provider_id ON provider_auth_bindings(provider_id);
 "#;
