@@ -269,3 +269,52 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     }
     fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_claude_profile, sync_codex};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn infer_claude_profile_uses_model_family() {
+        assert_eq!(infer_claude_profile("claude-3-5-haiku"), "haiku");
+        assert_eq!(infer_claude_profile("claude-3-7-sonnet"), "sonnet");
+        assert_eq!(infer_claude_profile("claude-4-opus"), "opus");
+    }
+
+    #[test]
+    fn sync_codex_writes_auth_and_config_and_removes_models_override() {
+        let root = std::env::temp_dir().join(format!(
+            "nyroctl-connect-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let auth_path = root.join("auth.json");
+        let config_path = root.join("config.toml");
+        let models_path = root.join("models.json");
+        fs::write(&models_path, "{}").expect("seed models.json");
+
+        sync_codex(
+            &auth_path,
+            &config_path,
+            &models_path,
+            "http://127.0.0.1:19550",
+            "dummy",
+            "zhipu-forced-anthropic",
+        )
+        .expect("sync codex");
+
+        let auth = fs::read_to_string(&auth_path).expect("read auth.json");
+        let config = fs::read_to_string(&config_path).expect("read config.toml");
+        assert!(auth.contains("\"OPENAI_API_KEY\": \"dummy\""));
+        assert!(config.contains("model_provider = \"nyro\""));
+        assert!(config.contains("model = \"zhipu-forced-anthropic\""));
+        assert!(config.contains("base_url = \"http://127.0.0.1:19550/v1\""));
+        assert!(!PathBuf::from(&models_path).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

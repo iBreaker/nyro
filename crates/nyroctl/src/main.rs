@@ -740,13 +740,7 @@ async fn run_interactive_oauth_login(admin: &AdminClient, args: OauthLoginArgs) 
         );
         eprintln!("After browser login, paste the full callback URL or the authorization code.");
         let pasted = prompt_line("callback URL or code")?;
-        let trimmed = pasted.trim();
-        let (callback_url, code) =
-            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                (Some(trimmed.to_string()), None)
-            } else {
-                (None, Some(trimmed.to_string()))
-            };
+        let (callback_url, code) = parse_oauth_manual_input(&pasted);
         admin.post::<_, AuthSessionStatusData>(
             &format!("/oauth/sessions/{}/complete", init.session_id),
             &AuthExchangeInput {
@@ -825,6 +819,15 @@ fn prompt_line(label: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
+fn parse_oauth_manual_input(input: &str) -> (Option<String>, Option<String>) {
+    let trimmed = input.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        (Some(trimmed.to_string()), None)
+    } else {
+        (None, Some(trimmed.to_string()))
+    }
+}
+
 fn open_in_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     let candidates: &[(&str, &[&str])] = &[("open", &[])];
@@ -843,6 +846,213 @@ fn open_in_browser(url: &str) -> anyhow::Result<()> {
     }
 
     anyhow::bail!("no browser opener succeeded")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[test]
+    fn build_log_query_encodes_and_skips_empty_values() {
+        let query = build_log_query(LogsQueryArgs {
+            limit: Some(10),
+            offset: Some(20),
+            provider: Some("Codex / China".to_string()),
+            model: Some("glm-4.5-air".to_string()),
+            status_min: Some(200),
+            status_max: Some(299),
+        });
+
+        assert_eq!(
+            query,
+            "?limit=10&offset=20&provider=Codex%20%2F%20China&model=glm-4.5-air&status_min=200&status_max=299"
+        );
+    }
+
+    #[test]
+    fn with_hours_handles_some_and_none() {
+        assert_eq!(with_hours("/stats/overview", None), "/stats/overview");
+        assert_eq!(with_hours("/stats/overview", Some(24)), "/stats/overview?hours=24");
+    }
+
+    #[test]
+    fn parse_oauth_manual_input_distinguishes_url_and_code() {
+        assert_eq!(
+            parse_oauth_manual_input("https://localhost/callback?code=abc"),
+            (Some("https://localhost/callback?code=abc".to_string()), None)
+        );
+        assert_eq!(
+            parse_oauth_manual_input("auth-code-123"),
+            (None, Some("auth-code-123".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_login_no_wait_returns_pending_codex_session() {
+        let responses = vec![
+            mock_json_response(
+                serde_json::json!({
+                    "data": {
+                        "session_id": "session-1",
+                        "vendor": "codex",
+                        "scheme": "oauth_auth_code_pkce",
+                        "auth_url": "https://auth.example/authorize",
+                        "requires_manual_code": true,
+                        "user_code": "",
+                        "verification_uri": "https://auth.example",
+                        "verification_uri_complete": "https://auth.example/authorize",
+                        "expires_in": 600,
+                        "interval": 2
+                    }
+                })
+                .to_string(),
+            ),
+            mock_json_response(
+                serde_json::json!({
+                    "data": {
+                        "status": "pending",
+                        "scheme": "oauth_auth_code_pkce",
+                        "auth_url": "https://auth.example/authorize",
+                        "requires_manual_code": true,
+                        "expires_in": 599,
+                        "interval": 2,
+                        "user_code": "",
+                        "verification_uri_complete": "https://auth.example/authorize"
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+        let (base_url, paths, handle) = spawn_mock_admin_server(responses);
+        let admin = AdminClient::new(base_url, None);
+
+        let value = run_interactive_oauth_login(
+            &admin,
+            OauthLoginArgs {
+                vendor: "codex-cli".to_string(),
+                use_proxy: false,
+                file: None,
+                no_open: true,
+                no_wait: true,
+                poll_seconds: 1,
+                timeout_seconds: 10,
+            },
+        )
+        .await
+        .expect("oauth login should succeed");
+
+        let requests = paths.lock().expect("paths lock");
+        assert_eq!(
+            requests.as_slice(),
+            ["/oauth/sessions/init", "/oauth/sessions/session-1/status"]
+        );
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["result"]["status"], "pending");
+        assert_eq!(value["result"]["requires_manual_code"], true);
+        drop(requests);
+        handle.join().expect("mock server join");
+    }
+
+    #[tokio::test]
+    async fn oauth_login_no_wait_returns_pending_qwen_session() {
+        let responses = vec![
+            mock_json_response(
+                serde_json::json!({
+                    "data": {
+                        "session_id": "session-2",
+                        "vendor": "qwen-code-cli",
+                        "scheme": "oauth_device_code",
+                        "auth_url": "https://chat.qwen.ai/authorize?user_code=ABCD",
+                        "requires_manual_code": false,
+                        "user_code": "ABCD",
+                        "verification_uri": "https://chat.qwen.ai/authorize",
+                        "verification_uri_complete": "https://chat.qwen.ai/authorize?user_code=ABCD",
+                        "expires_in": 900,
+                        "interval": 2
+                    }
+                })
+                .to_string(),
+            ),
+            mock_json_response(
+                serde_json::json!({
+                    "data": {
+                        "status": "pending",
+                        "scheme": "oauth_device_code",
+                        "auth_url": "https://chat.qwen.ai/authorize?user_code=ABCD",
+                        "requires_manual_code": false,
+                        "expires_in": 899,
+                        "interval": 2,
+                        "user_code": "ABCD",
+                        "verification_uri_complete": "https://chat.qwen.ai/authorize?user_code=ABCD"
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+        let (base_url, _paths, handle) = spawn_mock_admin_server(responses);
+        let admin = AdminClient::new(base_url, None);
+
+        let value = run_interactive_oauth_login(
+            &admin,
+            OauthLoginArgs {
+                vendor: "qwen-code-cli".to_string(),
+                use_proxy: false,
+                file: None,
+                no_open: true,
+                no_wait: true,
+                poll_seconds: 1,
+                timeout_seconds: 10,
+            },
+        )
+        .await
+        .expect("oauth login should succeed");
+
+        assert_eq!(value["session_id"], "session-2");
+        assert_eq!(value["result"]["status"], "pending");
+        assert_eq!(value["result"]["user_code"], "ABCD");
+        handle.join().expect("mock server join");
+    }
+
+    fn spawn_mock_admin_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let paths_for_thread = Arc::clone(&paths);
+        let handle = thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 8192];
+                let size = stream.read(&mut buf).expect("read request");
+                let req = String::from_utf8_lossy(&buf[..size]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                paths_for_thread.lock().expect("paths").push(path);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        (format!("http://{addr}"), paths, handle)
+    }
+
+    fn mock_json_response(body: String) -> String {
+        body
+    }
 }
 
 fn load_data_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> anyhow::Result<T> {

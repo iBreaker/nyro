@@ -2588,8 +2588,18 @@ fn to_models_dev_capability(vendor_key: &str, model: &ModelsDevModelEntry) -> Mo
 #[cfg(test)]
 mod tests {
     use super::{
-        default_static_models_for_vendor, extract_models_from_response, provider_static_models,
+        build_auth_session_pending_data, default_static_models_for_vendor,
+        extract_models_from_response, provider_static_models,
     };
+    use crate::auth::types::{
+        AuthBindingStatus, AuthScheme, AuthSessionStatus, CreateAuthSession, CredentialBundle,
+        UpsertProviderAuthBinding,
+    };
+    use crate::config::GatewayConfig;
+    use crate::db::models::CreateProvider;
+    use crate::Gateway;
+    use base64::Engine;
+    use uuid::Uuid;
 
     #[test]
     fn extracts_codex_models_from_slug_field() {
@@ -2657,5 +2667,262 @@ mod tests {
             provider_static_models(&provider),
             vec!["gemini-2.5-flash".to_string(), "gemini-2.5-pro".to_string()]
         );
+    }
+
+    #[test]
+    fn pending_auth_session_marks_pkce_flow_as_manual() {
+        let session = crate::auth::types::AuthSession {
+            id: "session".to_string(),
+            provider_id: None,
+            driver_key: "codex".to_string(),
+            scheme: AuthScheme::OAuthAuthCodePkce.as_str().to_string(),
+            status: AuthSessionStatus::Pending.as_str().to_string(),
+            use_proxy: false,
+            user_code: None,
+            verification_uri: Some("https://auth.openai.com".to_string()),
+            verification_uri_complete: Some("https://auth.openai.com/oauth/authorize".to_string()),
+            state_json: Some("{}".to_string()),
+            context_json: None,
+            result_json: None,
+            expires_at: Some("2099-01-01 00:00:00".to_string()),
+            poll_interval_seconds: Some(2),
+            last_error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        let status = build_auth_session_pending_data(&session);
+        match status {
+            crate::auth::types::AuthSessionStatusData::Pending {
+                requires_manual_code,
+                ..
+            } => assert!(requires_manual_code),
+            other => panic!("expected pending status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_status_for_codex_pending_session_returns_pending() {
+        let (gateway, _tmp_dir) = test_gateway().await;
+        let store = gateway.storage.auth_sessions().expect("auth session store");
+        let session = store
+            .create(CreateAuthSession {
+                provider_id: None,
+                driver_key: "codex".to_string(),
+                scheme: AuthScheme::OAuthAuthCodePkce.as_str().to_string(),
+                status: AuthSessionStatus::Pending.as_str().to_string(),
+                use_proxy: false,
+                user_code: None,
+                verification_uri: Some("https://auth.openai.com".to_string()),
+                verification_uri_complete: Some(
+                    "https://auth.openai.com/oauth/authorize".to_string(),
+                ),
+                state_json: Some("{}".to_string()),
+                context_json: None,
+                result_json: None,
+                expires_at: Some("2099-01-01 00:00:00".to_string()),
+                poll_interval_seconds: Some(2),
+                last_error: None,
+            })
+            .await
+            .expect("create auth session");
+
+        let status = gateway
+            .admin()
+            .get_oauth_session_status(&session.id)
+            .await
+            .expect("get oauth session status");
+
+        match status {
+            crate::auth::types::AuthSessionStatusData::Pending {
+                requires_manual_code,
+                ..
+            } => assert!(requires_manual_code),
+            other => panic!("expected pending status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_provider_with_oauth_session_persists_binding_and_removes_session() {
+        let (gateway, _tmp_dir) = test_gateway().await;
+        let store = gateway.storage.auth_sessions().expect("auth session store");
+        let fake_token = fake_openai_access_token("acct-test");
+        let session = store
+            .create(CreateAuthSession {
+                provider_id: None,
+                driver_key: "codex".to_string(),
+                scheme: AuthScheme::OAuthAuthCodePkce.as_str().to_string(),
+                status: AuthSessionStatus::Ready.as_str().to_string(),
+                use_proxy: false,
+                user_code: None,
+                verification_uri: Some("https://auth.openai.com".to_string()),
+                verification_uri_complete: Some(
+                    "https://auth.openai.com/oauth/authorize".to_string(),
+                ),
+                state_json: Some("{}".to_string()),
+                context_json: None,
+                result_json: Some(
+                    serde_json::to_string(&CredentialBundle {
+                        access_token: Some(fake_token.clone()),
+                        refresh_token: Some("refresh-token".to_string()),
+                        expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                        resource_url: None,
+                        subject_id: Some("subject".to_string()),
+                        scopes: vec!["openid".to_string()],
+                        raw: serde_json::json!({}),
+                    })
+                    .expect("serialize credential bundle"),
+                ),
+                expires_at: Some("2099-01-01 00:00:00".to_string()),
+                poll_interval_seconds: Some(2),
+                last_error: None,
+            })
+            .await
+            .expect("create auth session");
+
+        let provider = gateway
+            .admin()
+            .create_provider_with_oauth_session(
+                &session.id,
+                CreateProvider {
+                    name: "OAuth Provider".to_string(),
+                    vendor: None,
+                    protocol: "openai".to_string(),
+                    base_url: "https://example.invalid/v1".to_string(),
+                    default_protocol: Some("openai".to_string()),
+                    protocol_endpoints: Some("{}".to_string()),
+                    preset_key: None,
+                    channel: None,
+                    models_source: None,
+                    capabilities_source: None,
+                    static_models: None,
+                    api_key: String::new(),
+                    use_proxy: false,
+                },
+            )
+            .await
+            .expect("create provider with oauth session");
+
+        assert_eq!(provider.vendor.as_deref(), Some("codex"));
+        assert!(provider.base_url.contains("chatgpt.com/backend-api/codex"));
+        assert_eq!(provider.api_key, fake_token);
+        assert!(
+            gateway
+                .storage
+                .auth_sessions()
+                .expect("auth session store")
+                .get(&session.id)
+                .await
+                .expect("get session")
+                .is_none()
+        );
+        let binding = gateway
+            .storage
+            .provider_auth_bindings()
+            .expect("binding store")
+            .get_by_provider_and_driver(&provider.id, "codex")
+            .await
+            .expect("get binding")
+            .expect("binding exists");
+        assert_eq!(binding.status, AuthBindingStatus::Connected.as_str());
+        assert_eq!(binding.access_token.as_deref(), Some(fake_token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn logout_provider_oauth_clears_binding_and_api_key() {
+        let (gateway, _tmp_dir) = test_gateway().await;
+        let provider = gateway
+            .admin()
+            .create_provider(CreateProvider {
+                name: "Codex Provider".to_string(),
+                vendor: Some("codex".to_string()),
+                protocol: "openai".to_string(),
+                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                default_protocol: Some("openai".to_string()),
+                protocol_endpoints: Some(
+                    serde_json::json!({"openai": {"base_url": "https://chatgpt.com/backend-api/codex"}})
+                        .to_string(),
+                ),
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                capabilities_source: None,
+                static_models: None,
+                api_key: "access-token".to_string(),
+                use_proxy: false,
+            })
+            .await
+            .expect("create provider");
+
+        gateway
+            .storage
+            .provider_auth_bindings()
+            .expect("binding store")
+            .upsert(UpsertProviderAuthBinding {
+                provider_id: provider.id.clone(),
+                driver_key: "codex".to_string(),
+                scheme: AuthScheme::OAuthAuthCodePkce.as_str().to_string(),
+                status: AuthBindingStatus::Connected.as_str().to_string(),
+                access_token: Some("access-token".to_string()),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+                resource_url: None,
+                subject_id: None,
+                scopes_json: Some("[]".to_string()),
+                meta_json: Some("{}".to_string()),
+                last_error: None,
+            })
+            .await
+            .expect("upsert binding");
+
+        let status = gateway
+            .admin()
+            .logout_provider_oauth(&provider.id)
+            .await
+            .expect("logout provider oauth");
+
+        assert_eq!(status.status, AuthBindingStatus::Disconnected.as_str());
+        assert!(
+            gateway
+                .storage
+                .provider_auth_bindings()
+                .expect("binding store")
+                .get_by_provider_and_driver(&provider.id, "codex")
+                .await
+                .expect("get binding")
+                .is_none()
+        );
+        let updated_provider = gateway
+            .storage
+            .providers()
+            .get(&provider.id)
+            .await
+            .expect("get provider")
+            .expect("provider exists");
+        assert!(updated_provider.api_key.is_empty());
+    }
+
+    async fn test_gateway() -> (Gateway, std::path::PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!("nyro-admin-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        let config = GatewayConfig {
+            data_dir: data_dir.clone(),
+            ..GatewayConfig::default()
+        };
+        let (gateway, _log_rx) = Gateway::new(config).await.expect("create gateway");
+        (gateway, data_dir)
+    }
+
+    fn fake_openai_access_token(account_id: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"none"}"#);
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id
+            }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).expect("serialize claims"));
+        format!("{header}.{payload}.sig")
     }
 }
