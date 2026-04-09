@@ -667,6 +667,21 @@ body {
   background: rgba(255, 255, 255, 0.78);
 }
 
+.connect-switch-tabs-list {
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  background: rgba(241, 245, 249, 0.9);
+}
+
+.connect-switch-tab-trigger {
+  color: #475569;
+}
+
+.connect-switch-tab-trigger[data-state="active"] {
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
 .connect-code-copy-btn {
   background: #f1f5f9;
   color: #475569;
@@ -826,6 +841,21 @@ html[data-theme="dark"] .connect-panel {
   background: rgba(7, 10, 18, 0.86);
 }
 
+html[data-theme="dark"] .connect-switch-tabs-list {
+  border-color: rgba(148, 163, 184, 0.28);
+  background: rgba(30, 41, 59, 0.72);
+}
+
+html[data-theme="dark"] .connect-switch-tab-trigger {
+  color: #cbd5e1;
+}
+
+html[data-theme="dark"] .connect-switch-tab-trigger[data-state="active"] {
+  background: rgba(2, 6, 23, 0.9);
+  color: #f8fafc;
+  box-shadow: 0 1px 2px rgba(2, 6, 23, 0.35);
+}
+
 html[data-theme="dark"] .connect-code-copy-btn {
   background: rgba(17, 24, 39, 0.92);
   color: #cbd5e1;
@@ -864,6 +894,17 @@ html[data-theme="dark"] .connect-cli-shell {
 html[data-theme="dark"] .connect-cli-preview {
   border-color: rgba(148, 163, 184, 0.34);
   background: rgba(9, 14, 24, 0.9);
+}
+
+html[data-theme="dark"] .connect-label-badge {
+  border-color: rgba(148, 163, 184, 0.34) !important;
+  background: transparent !important;
+  color: #f8fafc !important;
+}
+
+html[data-theme="dark"] .route-targets-panel {
+  border-color: rgba(148, 163, 184, 0.34) !important;
+  background: rgba(8, 12, 20, 0.86) !important;
 }
 
 html[data-theme="dark"] .provider-preset-card:hover {

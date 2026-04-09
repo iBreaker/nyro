@@ -217,6 +217,48 @@ pub async fn set_setting(
     gw.admin().set_setting(&key, &value).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_cache_settings(gw: State<'_, Gateway>) -> Result<serde_json::Value, String> {
+    gw.admin().get_cache_settings().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_cache_settings(
+    gw: State<'_, Gateway>,
+    input: serde_json::Value,
+) -> Result<(), String> {
+    gw.admin()
+        .update_cache_settings(input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn detect_embedding_dimensions(
+    gw: State<'_, Gateway>,
+    embedding_route: String,
+) -> Result<u64, String> {
+    gw.admin()
+        .detect_embedding_dimensions(&embedding_route)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn flush_cache(gw: State<'_, Gateway>) -> Result<(), String> {
+    gw.admin().flush_cache().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_cache_key(gw: State<'_, Gateway>, key: String) -> Result<(), String> {
+    gw.admin().delete_cache_key(&key).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_cache_stats(gw: State<'_, Gateway>) -> Result<serde_json::Value, String> {
+    gw.admin().get_cache_stats().await.map_err(|e| e.to_string())
+}
+
 // ── Status ──
 
 #[tauri::command]
@@ -530,7 +572,7 @@ pub async fn sync_cli_config(
     host: String,
     api_key: String,
     model: String,
-    capabilities: Option<CliModelCapabilities>,
+    _capabilities: Option<CliModelCapabilities>,
 ) -> Result<Vec<String>, String> {
     let home_dir = resolve_home_dir().ok_or_else(|| "failed to resolve home directory".to_string())?;
     let normalized_host = host.trim().trim_end_matches('/').to_string();
@@ -594,10 +636,6 @@ pub async fn sync_cli_config(
                 serde_json::Value::String(normalized_model.clone()),
             );
             env_obj.insert(
-                "ANTHROPIC_REASONING_MODEL".to_string(),
-                serde_json::Value::String(normalized_model.clone()),
-            );
-            env_obj.insert(
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
                 serde_json::Value::String(normalized_model.clone()),
             );
@@ -608,6 +646,10 @@ pub async fn sync_cli_config(
             env_obj.insert(
                 "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
                 serde_json::Value::String(normalized_model.clone()),
+            );
+            env_obj.insert(
+                "CLAUDE_CODE_NO_FLICKER".to_string(),
+                serde_json::Value::String("1".to_string()),
             );
             root.insert(
                 "model".to_string(),
@@ -652,57 +694,32 @@ pub async fn sync_cli_config(
                 &auth_json,
             )?;
 
-            let caps = capabilities.unwrap_or_default();
-            let mut config_lines = vec![
+            let config_lines = vec![
                 r#"model_provider = "nyro""#.to_string(),
-                format!(r#"model = "{}""#, normalized_model),
-                r#"model_context_window = 128000"#.to_string(),
+                format!(r#"model = "{normalized_model}""#),
+                r#"model_reasoning_effort = "high""#.to_string(),
+                r#"disable_response_storage = true"#.to_string(),
+                String::new(),
+                r#"[model_providers]"#.to_string(),
+                r#"[model_providers.nyro]"#.to_string(),
+                r#"name = "Nyro Gateway""#.to_string(),
+                format!(r#"base_url = "{}/v1""#, normalized_host),
+                r#"wire_api = "responses""#.to_string(),
+                r#"requires_openai_auth = true"#.to_string(),
             ];
-            if caps.reasoning.unwrap_or(false) {
-                config_lines.push(r#"model_reasoning_effort = "high""#.to_string());
-            }
-            config_lines.push(r#"disable_response_storage = true"#.to_string());
-            config_lines.push(format!(
-                r#"model_catalog_json = "{}""#,
-                models_path.to_string_lossy()
-            ));
-            config_lines.push(String::new());
-            config_lines.push(r#"[model_providers.nyro]"#.to_string());
-            config_lines.push(r#"name = "Nyro Gateway""#.to_string());
-            config_lines.push(format!(r#"base_url = "{}/v1""#, normalized_host));
-            config_lines.push(r#"wire_api = "responses""#.to_string());
-            config_lines.push(r#"requires_openai_auth = true"#.to_string());
-            config_lines.push(String::new());
             let config_toml = config_lines.join("\n");
             write_text_file(&config_path, &config_toml)?;
 
-            let models_json = serde_json::json!({
-                "models": [
-                    {
-                        "slug": normalized_model,
-                        "display_name": model.trim(),
-                        "supported_reasoning_levels": [],
-                        "shell_type": "shell_command",
-                        "visibility": "list",
-                        "supported_in_api": true,
-                        "priority": 1,
-                        "base_instructions": "",
-                        "supports_reasoning_summaries": false,
-                        "support_verbosity": false,
-                        "apply_patch_tool_type": "freeform",
-                        "truncation_policy": { "mode": "tokens", "limit": 10000 },
-                        "supports_parallel_tool_calls": false,
-                        "experimental_supported_tools": [],
-                        "context_window": caps.context_window.filter(|v| *v > 0).unwrap_or(128_000),
-                    }
-                ]
-            });
-            write_json_file(&models_path, &models_json)?;
-            Ok(vec![
+            let mut changed_paths = vec![
                 auth_path.to_string_lossy().to_string(),
                 config_path.to_string_lossy().to_string(),
-                models_path.to_string_lossy().to_string(),
-            ])
+            ];
+            if models_path.exists() {
+                fs::remove_file(&models_path)
+                    .map_err(|e| format!("failed removing codex model catalog {}: {e}", models_path.display()))?;
+                changed_paths.push(models_path.to_string_lossy().to_string());
+            }
+            Ok(changed_paths)
         }
         "gemini-cli" => {
             let env_path = get_gemini_env_path(&home_dir);

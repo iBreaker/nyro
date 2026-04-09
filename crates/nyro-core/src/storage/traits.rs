@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -36,7 +37,6 @@ pub struct ApiKeyAccessRecord {
 pub enum StorageBackend {
     Sqlite,
     Postgres,
-    MySql,
 }
 
 #[derive(Debug, Clone)]
@@ -45,14 +45,6 @@ pub struct StorageHealth {
     pub can_connect: bool,
     pub schema_compatible: bool,
     pub writable: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct StorageCapabilities {
-    pub transactions: bool,
-    pub batch_writes: bool,
-    pub aggregations: bool,
-    pub managed_migrations: bool,
 }
 
 #[async_trait]
@@ -74,13 +66,11 @@ pub trait RouteStore: Send + Sync {
     async fn update(&self, id: &str, input: UpdateRoute) -> anyhow::Result<Route>;
     async fn delete(&self, id: &str) -> anyhow::Result<()>;
     async fn exists_by_name(&self, name: &str, exclude_id: Option<&str>) -> anyhow::Result<bool>;
-    async fn exists_by_protocol_model(
+    async fn exists_by_virtual_model(
         &self,
-        ingress_protocol: &str,
         virtual_model: &str,
         exclude_id: Option<&str>,
     ) -> anyhow::Result<bool>;
-    async fn list_active(&self) -> anyhow::Result<Vec<Route>>;
 }
 
 #[async_trait]
@@ -120,6 +110,7 @@ pub trait ApiKeyStore: Send + Sync {
 pub trait AuthAccessStore: Send + Sync {
     async fn find_api_key(&self, raw_key: &str) -> anyhow::Result<Option<ApiKeyAccessRecord>>;
     async fn route_binding_exists(&self, api_key_id: &str, route_id: &str) -> anyhow::Result<bool>;
+    async fn list_bound_route_ids(&self, api_key_id: &str) -> anyhow::Result<Vec<String>>;
     async fn request_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64>;
     async fn token_count_since(&self, api_key_id: &str, window: UsageWindow) -> anyhow::Result<i64>;
 }
@@ -136,11 +127,19 @@ pub trait LogStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait CacheStore: Send + Sync {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn set(&self, key: &str, data: &[u8], ttl: Option<Duration>) -> anyhow::Result<()>;
+    async fn delete(&self, key: &str) -> anyhow::Result<()>;
+    async fn flush(&self) -> anyhow::Result<()>;
+    async fn cleanup_expired(&self) -> anyhow::Result<u64>;
+}
+
+#[async_trait]
 pub trait StorageBootstrap: Send + Sync {
     async fn init(&self) -> anyhow::Result<()>;
     async fn migrate(&self) -> anyhow::Result<()>;
     async fn health(&self) -> anyhow::Result<StorageHealth>;
-    fn capabilities(&self) -> StorageCapabilities;
 }
 
 pub trait Storage: Send + Sync {
@@ -158,6 +157,9 @@ pub trait Storage: Send + Sync {
         None
     }
     fn logs(&self) -> &dyn LogStore;
+    fn cache(&self) -> Option<&dyn CacheStore> {
+        None
+    }
     fn bootstrap(&self) -> &dyn StorageBootstrap;
 }
 

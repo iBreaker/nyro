@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/shuaijinchao/nyro/releases/latest"><img src="https://img.shields.io/github/v/release/shuaijinchao/nyro" alt="Release"></a>
+  <a href="https://github.com/NYRO-WAY/NYRO/releases/latest"><img src="https://img.shields.io/github/v/release/NYRO-WAY/NYRO" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
   <a href="README_CN.md"><img src="https://img.shields.io/badge/文档-中文-8A2BE2" alt="中文"></a>
 </p>
@@ -86,7 +86,7 @@ Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone ser
 
 ### Routing
 
-- Exact match routing on `(ingress_protocol, virtual_model)` pairs
+- Exact match routing on `virtual_model`
 - Virtual model names decouple client requests from actual backend models
 - Fallback routing with automatic failover on upstream errors
 - Per-route access control with API key authorization
@@ -153,7 +153,7 @@ Nyro detects installed tools, generates the correct configuration for the select
 **Homebrew (macOS / Linux)**
 
 ```bash
-brew tap shuaijinchao/nyro
+brew tap nyro-way/nyro
 brew install --cask nyro
 ```
 
@@ -161,15 +161,15 @@ brew install --cask nyro
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/shuaijinchao/nyro/master/scripts/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/NYRO-WAY/NYRO/master/scripts/install/install.sh | bash
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/shuaijinchao/nyro/master/scripts/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/NYRO-WAY/NYRO/master/scripts/install/install.ps1 | iex
 ```
 
 **Manual Download**
 
-Download the latest installer for your platform from [GitHub Releases](https://github.com/shuaijinchao/Nyro/releases/latest).
+Download the latest installer for your platform from [GitHub Releases](https://github.com/NYRO-WAY/NYRO/releases/latest).
 
 > **macOS**: After manual install run `sudo xattr -rd com.apple.quarantine /Applications/Nyro.app`, or use the install script which handles this automatically.
 >
@@ -179,7 +179,7 @@ Download the latest installer for your platform from [GitHub Releases](https://g
 
 ```bash
 # Download
-curl -LO https://github.com/shuaijinchao/nyro/releases/latest/download/nyro-server-linux-x86_64
+curl -LO https://github.com/NYRO-WAY/NYRO/releases/latest/download/nyro-server-linux-x86_64
 chmod +x nyro-server-linux-x86_64
 
 # Start (localhost only, no auth required)
@@ -201,24 +201,18 @@ Open `http://localhost:19531` for the management UI.
 
 Default server behavior remains unchanged: if you do not pass storage-related options, Nyro continues to use local SQLite under `--data-dir`.
 
-For `postgres` and `mysql`, the server binary also supports selecting a storage backend at startup. To avoid exposing credentials in process arguments, provide the DSN through an environment variable and reference it via `--storage-dsn-env`.
+For `postgres`, the server binary also supports selecting a storage backend at startup. To avoid exposing credentials in process arguments, provide the DSN through an environment variable and reference it via `--storage-dsn-env`.
 
 ```bash
 # PostgreSQL
 export NYRO_STORAGE_DSN='postgresql://user:pass@host:5432/db'
 ./nyro-server-linux-x86_64 \
   --storage-backend postgres
-
-# MySQL
-export NYRO_STORAGE_DSN='mysql://user:pass@host:3306/db'
-./nyro-server-linux-x86_64 \
-  --storage-backend mysql
-
 ```
 
 Additional storage-related server options:
 
-- `--storage-backend sqlite|postgres|mysql`
+- `--storage-backend sqlite|postgres`
 - `--storage-dsn-env` (defaults to `NYRO_STORAGE_DSN`)
 - `--sqlite-migrate-on-start true|false`
 - `--storage-max-connections`

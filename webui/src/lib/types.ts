@@ -4,16 +4,15 @@ export interface Provider {
   vendor?: string | null;
   protocol: string;
   base_url: string;
+  default_protocol: string;
+  protocol_endpoints: string;
   api_key?: string;
   use_proxy: boolean;
   preset_key?: string | null;
   channel?: string | null;
-  models_endpoint?: string | null;
   models_source?: string | null;
   capabilities_source?: string | null;
   static_models?: string | null;
-  last_test_success?: boolean | null;
-  last_test_at?: string | null;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -22,12 +21,13 @@ export interface Provider {
 export interface Route {
   id: string;
   name: string;
-  ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
   strategy: RouteStrategy;
   target_provider: string;
   target_model: string;
   access_control: boolean;
+  route_type?: "chat" | "embedding";
+  cache?: RouteCacheConfig;
   is_active: boolean;
   created_at: string;
   targets: RouteTarget[];
@@ -130,13 +130,11 @@ export interface ModelCapabilities {
   provider: string;
   model_id: string;
   context_window: number;
-  output_max_tokens?: number | null;
+  embedding_length?: number | null;
   tool_call: boolean;
   reasoning: boolean;
   input_modalities: string[];
   output_modalities: string[];
-  input_cost?: number | null;
-  output_cost?: number | null;
 }
 
 export type ProviderProtocol = "openai" | "anthropic" | "gemini";
@@ -171,10 +169,11 @@ export interface CreateProvider {
   vendor?: string;
   protocol: string;
   base_url: string;
+  default_protocol?: string;
+  protocol_endpoints?: string;
   use_proxy?: boolean;
   preset_key?: string;
   channel?: string;
-  models_endpoint?: string;
   models_source?: string;
   capabilities_source?: string;
   static_models?: string;
@@ -186,10 +185,11 @@ export interface UpdateProvider {
   vendor?: string;
   protocol?: string;
   base_url?: string;
+  default_protocol?: string;
+  protocol_endpoints?: string;
   use_proxy?: boolean;
   preset_key?: string;
   channel?: string;
-  models_endpoint?: string;
   models_source?: string;
   capabilities_source?: string;
   static_models?: string;
@@ -199,25 +199,59 @@ export interface UpdateProvider {
 
 export interface CreateRoute {
   name: string;
-  ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
   strategy?: RouteStrategy;
   target_provider: string;
   target_model: string;
   targets?: CreateRouteTarget[];
   access_control?: boolean;
+  route_type?: "chat" | "embedding";
+  cache?: RouteCacheConfig | null;
 }
 
 export interface UpdateRoute {
   name?: string;
-  ingress_protocol?: "openai" | "anthropic" | "gemini";
   virtual_model?: string;
   strategy?: RouteStrategy;
   target_provider?: string;
   target_model?: string;
   targets?: UpsertRouteTarget[];
   access_control?: boolean;
+  route_type?: "chat" | "embedding";
+  cache?: RouteCacheConfig | null;
   is_active?: boolean;
+}
+
+export interface RouteCacheConfig {
+  exact?: RouteExactCacheConfig;
+  semantic?: RouteSemanticCacheConfig;
+}
+
+export interface RouteExactCacheConfig {
+  ttl?: number | null;
+}
+
+export interface RouteSemanticCacheConfig {
+  ttl?: number | null;
+  threshold?: number | null;
+}
+
+export interface CacheSettings {
+  exact: {
+    enabled: boolean;
+    storage: "memory" | "database";
+    default_ttl: number;
+    max_entries: number;
+  };
+  semantic: {
+    enabled: boolean;
+    storage: "memory";
+    embedding_route: string;
+    similarity_threshold: number;
+    vector_dimensions: number;
+    default_ttl: number;
+    max_entries: number;
+  };
 }
 
 export interface CreateRouteTarget {
@@ -260,7 +294,6 @@ export interface LogQuery {
   limit?: number;
   offset?: number;
   provider?: string;
-  model?: string;
   status_min?: number;
   status_max?: number;
 }
@@ -277,10 +310,11 @@ export interface ExportProvider {
   vendor?: string | null;
   protocol: string;
   base_url: string;
+  default_protocol?: string;
+  protocol_endpoints?: string;
   use_proxy: boolean;
   preset_key?: string | null;
   channel?: string | null;
-  models_endpoint?: string | null;
   models_source?: string | null;
   capabilities_source?: string | null;
   static_models?: string | null;
@@ -290,9 +324,7 @@ export interface ExportProvider {
 
 export interface ExportRoute {
   name: string;
-  ingress_protocol: "openai" | "anthropic" | "gemini";
   virtual_model: string;
-  target_provider_name: string;
   target_model: string;
   access_control: boolean;
   is_active: boolean;

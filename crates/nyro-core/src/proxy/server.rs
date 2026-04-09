@@ -10,12 +10,17 @@ use crate::Gateway;
 pub fn create_router(gateway: Gateway) -> Router {
     let router = Router::new()
         .route("/v1/chat/completions", post(handler::openai_proxy))
+        .route("/chat/completions", post(handler::openai_proxy))
         .route("/v1/responses", post(handler::responses_proxy))
+        .route("/responses", post(handler::responses_proxy))
         .route("/v1/messages", post(handler::anthropic_proxy))
-        .route(
-            "/v1beta/models/:model_action",
-            post(handler::gemini_proxy),
-        )
+        .route("/messages", post(handler::anthropic_proxy))
+        .route("/v1/embeddings", post(handler::embeddings_proxy))
+        .route("/embeddings", post(handler::embeddings_proxy))
+        .route("/v1beta/models/:model_action",post(handler::gemini_proxy))
+        .route("/models/:model_action", post(handler::gemini_proxy))
+        .route("/v1/models", get(handler::models_list))
+        .route("/models", get(handler::models_list))
         .route("/health", get(health));
 
     let cors = build_proxy_cors_layer(&gateway.config.proxy_cors_origins, gateway.config.proxy_port);
