@@ -26,6 +26,8 @@ import {
   Eye,
   EyeOff,
   Info,
+  ToggleRight,
+  ToggleLeft,
 } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
 import { ProviderIcon } from "@/components/ui/provider-icon";
@@ -513,6 +515,17 @@ export default function ProvidersPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
     onError: (error: unknown) => {
       showErrorDialog("删除提供商失败", "Failed to delete provider", error);
+    },
+  });
+
+  const [providerToDisable, setProviderToDisable] = useState<Provider | null>(null);
+
+  const toggleEnabledMut = useMutation({
+    mutationFn: ({ id, is_enabled }: { id: string; is_enabled: boolean }) =>
+      backend("update_provider", { id, input: { is_enabled } }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
+    onError: (error: unknown) => {
+      showErrorDialog("操作失败", "Operation failed", error);
     },
   });
 
@@ -1059,26 +1072,20 @@ export default function ProvidersPage() {
                   </Button>
                 </div>
               </div>
-              <div className="space-y-2">
-                <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
-                <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
-                  <span className="text-xs text-slate-600">
-                    {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
-                  </span>
-                  <Switch
-                    checked={Boolean(form.use_proxy)}
-                    disabled={!isGlobalProxyEnabled}
-                    onCheckedChange={(checked) => setForm({ ...form, use_proxy: checked })}
-                  />
+              {isGlobalProxyEnabled && (
+                <div className="space-y-2">
+                  <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
+                  <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                    <span className="text-xs text-slate-600">
+                      {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
+                    </span>
+                    <Switch
+                      checked={Boolean(form.use_proxy)}
+                      onCheckedChange={(checked) => setForm({ ...form, use_proxy: checked })}
+                    />
+                  </div>
                 </div>
-                {!isGlobalProxyEnabled && (
-                  <p className="text-xs text-amber-600">
-                    {isZh
-                      ? "系统设置中的本地代理未启用，当前无法为 Provider 开启代理。"
-                      : "Local proxy is disabled in Settings, so provider proxy cannot be enabled."}
-                  </p>
-                )}
-              </div>
+              )}
               <div className="space-y-2">
                 <FieldLabel>API Key</FieldLabel>
                 <div className="relative">
@@ -1428,26 +1435,20 @@ export default function ProvidersPage() {
                         </Button>
                       </div>
                     </div>
-                    <div className="space-y-2">
-                      <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
-                      <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
-                        <span className="text-xs text-slate-600">
-                          {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
-                        </span>
-                        <Switch
-                          checked={Boolean(editForm.use_proxy)}
-                          disabled={!isGlobalProxyEnabled}
-                          onCheckedChange={(checked) => setEditForm({ ...editForm, use_proxy: checked })}
-                        />
+                    {isGlobalProxyEnabled && (
+                      <div className="space-y-2">
+                        <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
+                        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                          <span className="text-xs text-slate-600">
+                            {isZh ? "开启后走设置页中的本地代理地址" : "Route requests via local proxy from settings"}
+                          </span>
+                          <Switch
+                            checked={Boolean(editForm.use_proxy)}
+                            onCheckedChange={(checked) => setEditForm({ ...editForm, use_proxy: checked })}
+                          />
+                        </div>
                       </div>
-                      {!isGlobalProxyEnabled && (
-                        <p className="text-xs text-amber-600">
-                          {isZh
-                            ? "系统设置中的本地代理未启用，当前无法为 Provider 开启代理。"
-                            : "Local proxy is disabled in Settings, so provider proxy cannot be enabled."}
-                        </p>
-                      )}
-                    </div>
+                    )}
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "API Key" : "API Key"}</FieldLabel>
                       <div className="relative">
@@ -1590,6 +1591,16 @@ export default function ProvidersPage() {
                             {protocol}
                           </Badge>
                         ))}
+                        {isGlobalProxyEnabled && p.use_proxy && (
+                          <Badge variant="success" className="connect-label-badge">
+                            {isZh ? "本地代理" : "Proxy"}
+                          </Badge>
+                        )}
+                        {!p.is_enabled && (
+                          <Badge variant="danger" className="connect-label-badge">
+                            {isZh ? "已禁用" : "Disabled"}
+                          </Badge>
+                        )}
                         {status === "success" ? (
                           <CheckCircle
                             className="h-3.5 w-3.5 text-green-500"
@@ -1605,6 +1616,23 @@ export default function ProvidersPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-0.5">
+                    <button
+                      onClick={() => {
+                        if (p.is_enabled) {
+                          setProviderToDisable(p);
+                        } else {
+                          toggleEnabledMut.mutate({ id: p.id, is_enabled: true });
+                        }
+                      }}
+                      title={p.is_enabled ? (isZh ? "禁用" : "Disable") : (isZh ? "启用" : "Enable")}
+                      className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
+                    >
+                      {p.is_enabled ? (
+                        <ToggleRight className="h-4 w-4 text-green-500" />
+                      ) : (
+                        <ToggleLeft className="h-4 w-4 text-slate-400" />
+                      )}
+                    </button>
                     <button
                       onClick={() => handleTest(p)}
                       disabled={Boolean(testingId)}
@@ -1715,6 +1743,21 @@ export default function ProvidersPage() {
         </DialogContent>
       </Dialog>
 
+      <ConfirmDialog
+        open={Boolean(providerToDisable)}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDisable(null);
+        }}
+        title={isZh ? "确认禁用供应商" : "Confirm provider disable"}
+        description={isZh ? "禁用后，引用该供应商的路由请求将受影响，确认禁用？" : "After disabling, route requests referencing this provider will be affected. Confirm disable?"}
+        cancelText={isZh ? "取消" : "Cancel"}
+        confirmText={isZh ? "禁用" : "Disable"}
+        onConfirm={() => {
+          if (!providerToDisable) return;
+          toggleEnabledMut.mutate({ id: providerToDisable.id, is_enabled: false });
+          setProviderToDisable(null);
+        }}
+      />
       <ConfirmDialog
         open={Boolean(providerToDelete)}
         onOpenChange={(open) => {
