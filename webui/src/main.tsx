@@ -1,10 +1,8 @@
 import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Outlet, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-import { AuthGate } from "@/components/auth-gate";
-import { IS_TAURI } from "@/lib/backend";
 import { AppLayout } from "@/components/layout/app-layout";
 import { AppErrorBoundary } from "@/components/error-boundary";
 import { LocaleProvider } from "@/lib/i18n";
@@ -38,17 +36,15 @@ createRoot(document.getElementById("root")!).render(
           <BrowserRouter>
             <Suspense fallback={<div className="p-6 text-sm text-slate-500">Loading...</div>}>
               <Routes>
-                <Route element={IS_TAURI ? <Outlet /> : <AuthGate />}>
-                  <Route element={<AppLayout />}>
-                    <Route index element={<DashboardPage />} />
-                    <Route path="providers" element={<ProvidersPage />} />
-                    <Route path="routes" element={<RoutesPage />} />
-                    <Route path="api-keys" element={<ApiKeysPage />} />
-                    <Route path="logs" element={<LogsPage />} />
-                    <Route path="stats" element={<StatsPage />} />
-                    <Route path="connect" element={<ConnectPage />} />
-                    <Route path="settings" element={<SettingsPage />} />
-                  </Route>
+                <Route element={<AppLayout />}>
+                  <Route index element={<DashboardPage />} />
+                  <Route path="providers" element={<ProvidersPage />} />
+                  <Route path="routes" element={<RoutesPage />} />
+                  <Route path="api-keys" element={<ApiKeysPage />} />
+                  <Route path="logs" element={<LogsPage />} />
+                  <Route path="stats" element={<StatsPage />} />
+                  <Route path="connect" element={<ConnectPage />} />
+                  <Route path="settings" element={<SettingsPage />} />
                 </Route>
               </Routes>
             </Suspense>

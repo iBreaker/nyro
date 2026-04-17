@@ -398,10 +398,7 @@ async fn proxy_pipeline(
                         &ingress_str,
                         &ingress_str,
                         &request_model,
-                        cached_entry
-                            .actual_model
-                            .as_deref()
-                            .unwrap_or(&request_model),
+                        &request_model,
                         auth_key.id.as_deref(),
                         &cached_entry.provider_name,
                         cached_entry.status_code as i32,
@@ -441,10 +438,7 @@ async fn proxy_pipeline(
                                     &ingress_str,
                                     &ingress_str,
                                     &request_model,
-                                    cached_entry
-                                        .actual_model
-                                        .as_deref()
-                                        .unwrap_or(&request_model),
+                                    &request_model,
                                     auth_key.id.as_deref(),
                                     &cached_entry.provider_name,
                                     cached_entry.status_code as i32,
@@ -505,10 +499,7 @@ async fn proxy_pipeline(
                                 &ingress_str,
                                 &ingress_str,
                                 &request_model,
-                                cached_entry
-                                    .actual_model
-                                    .as_deref()
-                                    .unwrap_or(&request_model),
+                                &request_model,
                                 auth_key.id.as_deref(),
                                 &cached_entry.provider_name,
                                 cached_entry.status_code as i32,
@@ -849,7 +840,6 @@ async fn handle_non_stream(
             payload: output,
             status_code: status,
             provider_name: provider.name.clone(),
-            actual_model: Some(actual_model.to_string()),
             usage,
             created_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
             internal_response: Some(internal_resp),
@@ -1066,7 +1056,6 @@ async fn handle_stream(
                     payload,
                     status_code: 200,
                     provider_name: provider_name.clone(),
-                    actual_model: Some(act_model.clone()),
                     usage: internal.usage.clone(),
                     created_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
                     internal_response: Some(internal.clone()),
@@ -1104,7 +1093,6 @@ async fn handle_stream(
                     payload,
                     status_code: 200,
                     provider_name: provider_name.clone(),
-                    actual_model: Some(act_model.clone()),
                     usage: internal.usage.clone(),
                     created_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
                     internal_response: Some(internal.clone()),

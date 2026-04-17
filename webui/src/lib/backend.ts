@@ -1,5 +1,3 @@
-import { fetchAdminJson } from "@/lib/admin-auth";
-
 const IS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 async function invokeIPC<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -11,9 +9,25 @@ async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>): Promi
   const mapping = resolveHTTP(cmd, args);
   const init: RequestInit = { method: mapping.method };
   if (mapping.body) {
+    init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(mapping.body);
   }
-  return fetchAdminJson<T>(mapping.url, init);
+  const resp = await fetch(mapping.url, init);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${resp.status}`);
+  }
+  const text = await resp.text();
+  if (!text) return {} as T;
+  const json = JSON.parse(text);
+  if (json && typeof json === "object" && "error" in json) {
+    const errorMessage =
+      typeof json.error === "string" && json.error.trim()
+        ? json.error
+        : `Request failed: ${cmd}`;
+    throw new Error(errorMessage);
+  }
+  return json.data ?? json;
 }
 
 interface HTTPMapping {
