@@ -142,7 +142,11 @@ export interface ModelCapabilities {
   output_modalities: string[];
 }
 
-export type ProviderProtocol = "openai" | "anthropic" | "gemini";
+export type ProviderProtocol =
+  | "openai"
+  | "openai_responses"
+  | "anthropic"
+  | "gemini";
 
 export interface ProviderChannelPreset {
   id: string;

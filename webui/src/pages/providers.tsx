@@ -63,6 +63,7 @@ function protocolUrl(protocol: string) {
   switch (protocol) {
     case "anthropic": return "https://api.anthropic.com";
     case "gemini": return "https://generativelanguage.googleapis.com";
+    case "openai_responses": return "https://chatgpt.com/backend-api/codex";
     default: return "https://api.openai.com";
   }
 }
@@ -85,6 +86,7 @@ const PAGE_SIZE = 7;
 const DEFAULT_PRESET_ID = "custom";
 const protocolOptions = [
   { label: "OpenAI", value: "openai" },
+  { label: "OpenAI Responses", value: "openai_responses" },
   { label: "Anthropic", value: "anthropic" },
   { label: "Gemini", value: "gemini" },
 ] as const satisfies ReadonlyArray<{ label: string; value: ProviderProtocol }>;
@@ -263,7 +265,7 @@ function defaultModelsEndpoint(baseUrl: string, protocol: ProviderProtocol) {
     parsed = null;
   }
 
-  if (protocol === "openai" || protocol === "anthropic") {
+  if (protocol === "openai" || protocol === "openai_responses" || protocol === "anthropic") {
     // OpenRouter model discovery endpoint should be /api/v1/models.
     if (parsed?.host === "openrouter.ai") {
       const pathname = parsed.pathname.replace(/\/+$/, "");

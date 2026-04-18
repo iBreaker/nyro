@@ -30,7 +30,7 @@
       {
         "id": "codex",
         "label": { "zh": "Codex", "en": "Codex" },
-        "baseUrls": { "openai": "https://chatgpt.com/backend-api/codex" },
+        "baseUrls": { "openai_responses": "https://chatgpt.com/backend-api/codex" },
         "modelsSource": "https://chatgpt.com/backend-api/codex/models",
         "capabilitiesSource": "ai://models.dev/openai",
         "auth_mode": "oauth",

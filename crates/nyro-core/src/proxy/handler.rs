@@ -610,6 +610,7 @@ async fn proxy_pipeline(
 
         let miss_expose_headers =
             cache_config.exact.expose_headers || cache_config.semantic.expose_headers;
+        let upstream_forces_stream = matches!(egress, Protocol::ResponsesAPI);
         let response = if is_stream {
             handle_stream(
                 gw.clone(),
@@ -635,6 +636,32 @@ async fn proxy_pipeline(
                 semantic_write_ctx.clone(),
                 singleflight_leader.as_ref().map(|(k, _)| k.as_str()),
                 singleflight_leader.as_ref().map(|(_, tx)| tx.clone()),
+                miss_expose_headers,
+            )
+            .await
+        } else if upstream_forces_stream {
+            handle_non_stream_via_upstream_stream(
+                gw.clone(),
+                client,
+                adapter.as_ref(),
+                &provider,
+                &egress_base_url,
+                egress,
+                ingress,
+                &egress_path,
+                &credential,
+                egress_body,
+                request_headers,
+                &ingress_str,
+                &egress_str,
+                &request_model,
+                &actual_model,
+                auth_key.id.as_deref(),
+                start,
+                request_cache_key.as_deref(),
+                exact_enabled_for_route,
+                Some(exact_ttl),
+                semantic_write_ctx.clone(),
                 miss_expose_headers,
             )
             .await
@@ -820,6 +847,181 @@ async fn handle_non_stream(
                             vector,
                             bytes,
                         )
+                        .await;
+                }
+            }
+        }
+    }
+    response
+}
+
+/// Consume a streaming upstream response and return a non-streaming client
+/// response. Used when the egress protocol forces `stream: true` upstream
+/// (e.g. Responses API) but the ingress client requested non-stream.
+#[allow(clippy::too_many_arguments)]
+async fn handle_non_stream_via_upstream_stream(
+    gw: Gateway,
+    client: ProxyClient,
+    adapter: &dyn ProviderAdapter,
+    provider: &Provider,
+    egress_base_url: &str,
+    egress: Protocol,
+    ingress: Protocol,
+    path: &str,
+    credential: &str,
+    body: Value,
+    extra_headers: reqwest::header::HeaderMap,
+    ingress_str: &str,
+    egress_str: &str,
+    request_model: &str,
+    actual_model: &str,
+    api_key_id: Option<&str>,
+    start: Instant,
+    cache_key: Option<&str>,
+    allow_exact_store: bool,
+    exact_cache_ttl: Option<Duration>,
+    semantic_write_ctx: Option<SemanticWriteContext>,
+    expose_headers: bool,
+) -> Response {
+    let credential_to_use = credential.to_string();
+    let call_result = match client
+        .call_stream(
+            adapter,
+            egress_base_url,
+            path,
+            &credential_to_use,
+            body.clone(),
+            extra_headers.clone(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            emit_log(
+                &gw, ingress_str, egress_str, request_model, actual_model,
+                api_key_id,
+                &provider.name, 502, start.elapsed().as_millis() as f64,
+                TokenUsage::default(), false, false,
+                Some(e.to_string()), None,
+            );
+            return error_response(502, &format!("upstream error: {e}"));
+        }
+    };
+
+    let (resp, status) = call_result;
+
+    if status >= 400 {
+        let err_body: Value = resp
+            .json()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"error": {"message": "upstream error"}}));
+        emit_log(
+            &gw, ingress_str, egress_str, request_model, actual_model,
+            api_key_id,
+            &provider.name, status as i32, start.elapsed().as_millis() as f64,
+            TokenUsage::default(), false, false,
+            Some(err_body.to_string()), None,
+        );
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(err_body),
+        )
+            .into_response();
+    }
+
+    let mut stream_parser = crate::protocol::get_stream_parser(egress);
+    let mut byte_stream = resp.bytes_stream();
+    let mut accumulator = StreamResponseAccumulator::default();
+
+    while let Some(chunk) = byte_stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                emit_log(
+                    &gw, ingress_str, egress_str, request_model, actual_model,
+                    api_key_id,
+                    &provider.name, 502, start.elapsed().as_millis() as f64,
+                    TokenUsage::default(), false, false,
+                    Some(format!("stream read error: {e}")), None,
+                );
+                return error_response(502, &format!("upstream stream error: {e}"));
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        if let Ok(deltas) = stream_parser.parse_chunk(&text) {
+            accumulator.apply_all(&deltas);
+        }
+    }
+
+    if let Ok(deltas) = stream_parser.finish() {
+        accumulator.apply_all(&deltas);
+    }
+
+    let mut internal_resp = accumulator.into_internal_response();
+    if internal_resp.id.is_empty() {
+        internal_resp.id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    }
+    if internal_resp.model.is_empty() {
+        internal_resp.model = actual_model.to_string();
+    }
+    if internal_resp.stop_reason.is_none() {
+        internal_resp.stop_reason = Some("stop".to_string());
+    }
+    crate::protocol::semantic::reasoning::normalize_response_reasoning(&mut internal_resp);
+    crate::protocol::semantic::response_items::populate_response_items(&mut internal_resp);
+
+    let is_tool = !internal_resp.tool_calls.is_empty();
+    let usage = internal_resp.usage.clone();
+    let formatter = crate::protocol::get_response_formatter(ingress);
+    let output = formatter.format_response(&internal_resp);
+
+    let response_preview = serde_json::to_string(&output)
+        .ok()
+        .map(|s| s.chars().take(500).collect());
+
+    emit_log(
+        &gw, ingress_str, egress_str, request_model, actual_model,
+        api_key_id,
+        &provider.name, status as i32, start.elapsed().as_millis() as f64,
+        usage.clone(), false, is_tool, None, response_preview,
+    );
+
+    let mut response = (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+        Json(output.clone()),
+    )
+        .into_response();
+    set_cache_headers(&mut response, "MISS", cache_key, None, expose_headers);
+
+    if status < 400 && !is_tool {
+        let entry = CacheEntry {
+            payload: output,
+            status_code: status,
+            provider_name: provider.name.clone(),
+            actual_model: Some(actual_model.to_string()),
+            usage,
+            created_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
+            internal_response: Some(internal_resp),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&entry) {
+            if allow_exact_store {
+                let cache_backend = gw.cache_backend.read().await.clone();
+                if let (Some(key), Some(cache_backend)) = (cache_key, cache_backend.as_ref()) {
+                    let _ = cache_backend.set(key, &bytes, exact_cache_ttl).await;
+                }
+            }
+            let vector_store = gw.vector_store.read().await.clone();
+            if let (Some(vector_store), Some(ctx)) =
+                (vector_store.as_ref(), semantic_write_ctx.as_ref())
+            {
+                let vector = if let Some(existing) = ctx.query_vector.clone() {
+                    Some(existing)
+                } else {
+                    compute_embedding(&gw, &ctx.embedding_text).await.ok()
+                };
+                if let Some(vector) = vector {
+                    let _ = vector_store
+                        .upsert(&ctx.partition, ctx.key.clone(), vector, bytes)
                         .await;
                 }
             }
