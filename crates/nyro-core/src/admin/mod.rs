@@ -305,7 +305,7 @@ impl AdminService {
         if input.vendor.as_deref().unwrap_or("").trim().is_empty() {
             input.vendor = Some(session.driver_key.clone());
         }
-        input.api_key = access_token.clone();
+        input.access_token = Some(access_token);
         input.auth_mode = "oauth".to_string();
 
         let provider = match self.create_provider(input).await {
@@ -520,6 +520,18 @@ impl AdminService {
             input.channel.as_deref(),
         )
         .unwrap_or(input.auth_mode);
+        let mut api_key = Some(input.api_key);
+        let mut access_token = input.access_token;
+        let mut refresh_token = input.refresh_token;
+        let mut expires_at = input.expires_at;
+        normalize_provider_credentials_for_mode(
+            &auth_mode,
+            &mut api_key,
+            &mut access_token,
+            &mut refresh_token,
+            &mut expires_at,
+        );
+        let api_key = api_key.unwrap_or_default();
         self.gw
             .storage
             .providers()
@@ -535,11 +547,11 @@ impl AdminService {
                 models_source: input.models_source,
                 capabilities_source: input.capabilities_source,
                 static_models: input.static_models,
-                api_key: input.api_key,
+                api_key,
                 auth_mode,
-                access_token: input.access_token,
-                refresh_token: input.refresh_token,
-                expires_at: input.expires_at,
+                access_token,
+                refresh_token,
+                expires_at,
                 use_proxy: input.use_proxy,
             })
             .await
@@ -576,6 +588,17 @@ impl AdminService {
         let access_token = input.access_token.or(current.access_token);
         let refresh_token = input.refresh_token.or(current.refresh_token);
         let expires_at = input.expires_at.or(current.expires_at);
+        let mut api_key = Some(api_key);
+        let mut access_token = access_token;
+        let mut refresh_token = refresh_token;
+        let mut expires_at = expires_at;
+        normalize_provider_credentials_for_mode(
+            &auth_mode,
+            &mut api_key,
+            &mut access_token,
+            &mut refresh_token,
+            &mut expires_at,
+        );
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
         let base_url_changed = base_url != current_base_url;
@@ -598,7 +621,7 @@ impl AdminService {
                     models_source,
                     capabilities_source,
                     static_models,
-                    api_key: Some(api_key),
+                    api_key,
                     auth_mode: Some(auth_mode),
                     access_token,
                     refresh_token,
@@ -1883,11 +1906,17 @@ impl AdminService {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .or_else(|| provider.capabilities_source.clone());
-        let api_key = credential
-            .access_token
-            .clone()
-            .or_else(|| Some(provider.api_key.clone()))
-            .unwrap_or_default();
+        let mut api_key = Some(provider.api_key.clone());
+        let mut access_token = credential.access_token.clone();
+        let mut refresh_token = credential.refresh_token.clone();
+        let mut expires_at = credential.expires_at.clone();
+        normalize_provider_credentials_for_mode(
+            "oauth",
+            &mut api_key,
+            &mut access_token,
+            &mut refresh_token,
+            &mut expires_at,
+        );
         let protocol_endpoints = Some(sync_runtime_protocol_endpoints(provider, &base_url)?);
 
         self.gw
@@ -1900,18 +1929,18 @@ impl AdminService {
                     protocol_endpoints,
                     models_source,
                     capabilities_source,
-                    api_key: Some(api_key),
+                    api_key,
                     auth_mode: Some("oauth".to_string()),
-                    access_token: credential.access_token.clone(),
-                    refresh_token: credential.refresh_token.clone(),
-                    expires_at: credential.expires_at.clone(),
+                    access_token,
+                    refresh_token,
+                    expires_at,
                     ..Default::default()
                 },
             )
             .await
     }
 
-    pub async fn refresh_oauth_bindings(&self) -> anyhow::Result<usize> {
+    pub async fn refresh_oauth_providers(&self) -> anyhow::Result<usize> {
         let providers = self.list_providers().await?;
         let mut refreshed = 0usize;
 
@@ -2146,6 +2175,33 @@ fn normalized_optional(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn normalize_provider_credentials_for_mode(
+    auth_mode: &str,
+    api_key: &mut Option<String>,
+    access_token: &mut Option<String>,
+    refresh_token: &mut Option<String>,
+    expires_at: &mut Option<String>,
+) {
+    match auth_mode.trim() {
+        "oauth" => {
+            let normalized_access_token = normalized_optional(access_token.as_deref())
+                .or_else(|| normalized_optional(api_key.as_deref()));
+            *access_token = normalized_access_token;
+            *api_key = None;
+        }
+        _ => {
+            let normalized_api_key = normalized_optional(api_key.as_deref()).unwrap_or_default();
+            *api_key = Some(normalized_api_key);
+            *access_token = None;
+            *refresh_token = None;
+            *expires_at = None;
+        }
+    }
+
+    *refresh_token = normalized_optional(refresh_token.as_deref());
+    *expires_at = normalized_optional(expires_at.as_deref());
 }
 
 fn flatten_route_cache_columns(
