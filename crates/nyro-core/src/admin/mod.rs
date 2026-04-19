@@ -462,6 +462,8 @@ impl AdminService {
                 &provider.id,
                 UpdateProvider {
                     auth_mode: Some("oauth".to_string()),
+                    // Clear api_key as a legacy compatibility cleanup in case older records
+                    // mirrored OAuth access tokens into that field.
                     api_key: Some(String::new()),
                     access_token: Some(String::new()),
                     refresh_token: Some(String::new()),
@@ -1763,31 +1765,29 @@ impl AdminService {
         }
 
         let access_token = normalized_optional(provider.access_token.as_deref());
-        let fallback = normalized_optional(Some(provider.api_key.as_str()))
-            .filter(|value| Some(value.as_str()) != access_token.as_deref());
         let driver_key = provider
             .vendor
             .as_deref()
             .map(auth::normalize_driver_key)
             .unwrap_or_default();
         if driver_key.is_empty() {
-            if let Some(access_token) = access_token.or(fallback) {
+            if let Some(access_token) = access_token {
                 return Ok(ResolvedProviderRuntime {
                     access_token,
                     binding: RuntimeBinding::default(),
                 });
             }
-            anyhow::bail!("provider credential is empty");
+            anyhow::bail!("provider oauth access token is empty");
         }
 
         let Some(driver) = auth::build_driver(&driver_key) else {
-            if let Some(access_token) = access_token.or(fallback) {
+            if let Some(access_token) = access_token {
                 return Ok(ResolvedProviderRuntime {
                     access_token,
                     binding: RuntimeBinding::default(),
                 });
             }
-            anyhow::bail!("provider credential is empty");
+            anyhow::bail!("provider oauth access token is empty");
         };
 
         let credential = stored_credential_from_provider(provider, &driver_key);
@@ -1812,19 +1812,7 @@ impl AdminService {
             .trim()
             .to_string();
         if refresh_token.is_empty() {
-            if !access_token.is_empty() {
-                return Ok(ResolvedProviderRuntime {
-                    access_token,
-                    binding: driver.bind_runtime(provider, &credential)?,
-                });
-            }
-            let Some(fallback) = fallback else {
-                anyhow::bail!("provider credential is empty");
-            };
-            return Ok(ResolvedProviderRuntime {
-                access_token: fallback,
-                binding: driver.bind_runtime(provider, &credential)?,
-            });
+            anyhow::bail!("provider oauth refresh token is missing");
         }
 
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
@@ -1841,12 +1829,6 @@ impl AdminService {
         {
             Ok(bundle) => bundle,
             Err(error) => {
-                if let Some(fallback) = fallback {
-                    return Ok(ResolvedProviderRuntime {
-                        access_token: fallback,
-                        binding: driver.bind_runtime(provider, &credential)?,
-                    });
-                }
                 return Err(error.context("refresh oauth access token"));
             }
         };
@@ -1865,14 +1847,6 @@ impl AdminService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
-            .or_else(|| {
-                let fallback = refreshed_provider.api_key.trim();
-                if fallback.is_empty() {
-                    None
-                } else {
-                    Some(fallback.to_string())
-                }
-            })
             .ok_or_else(|| anyhow::anyhow!("provider credential refresh returned empty access token"))?;
 
         Ok(ResolvedProviderRuntime {
@@ -2052,8 +2026,7 @@ fn build_provider_oauth_status(
     fallback_error: Option<String>,
 ) -> ProviderOAuthStatusData {
     let access_token = normalized_optional(provider.access_token.as_deref());
-    let fallback_api_key = normalized_optional(Some(provider.api_key.as_str()));
-    let has_access_token = access_token.is_some() || fallback_api_key.is_some();
+    let has_access_token = access_token.is_some();
     let status = status_override.unwrap_or_else(|| {
         if provider.effective_auth_mode().trim() == "oauth" && has_access_token {
             AuthBindingStatus::Connected.as_str().to_string()
@@ -3265,6 +3238,7 @@ mod tests {
 
         let updated = gw.admin().get_provider(&provider.id).await?;
         assert_eq!(updated.effective_auth_mode(), "oauth");
+        assert!(updated.api_key.is_empty());
         assert!(updated.access_token.as_deref().unwrap_or("").is_empty());
         assert!(updated.refresh_token.as_deref().unwrap_or("").is_empty());
         assert!(updated.expires_at.as_deref().unwrap_or("").is_empty());
@@ -3273,7 +3247,11 @@ mod tests {
             Ok(_) => anyhow::bail!("logged out oauth provider should not resolve runtime credentials"),
             Err(err) => err,
         };
-        assert!(runtime_err.to_string().contains("provider credential is empty"));
+        let runtime_err_message = runtime_err.to_string();
+        assert!(
+            runtime_err_message.contains("access token") || runtime_err_message.contains("refresh token"),
+            "unexpected runtime error: {runtime_err_message}"
+        );
 
         Ok(())
     }
