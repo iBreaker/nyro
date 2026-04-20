@@ -1361,7 +1361,17 @@ export default function ProvidersPage() {
                           <Input
                             placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
                             value={createOAuthCallbackUrl}
-                            onChange={(e) => setCreateOAuthCallbackUrl(e.target.value)}
+                            onChange={(e) => {
+                              const url = e.target.value;
+                              setCreateOAuthCallbackUrl(url);
+                              try {
+                                const parsed = new URL(url);
+                                const code = parsed.searchParams.get("code");
+                                if (code) setCreateOAuthCode(code);
+                              } catch {
+                                // not a valid URL yet, ignore
+                              }
+                            }}
                             disabled={!createOAuthSession || createOAuthBusy}
                           />
                         </div>
@@ -1414,28 +1424,6 @@ export default function ProvidersPage() {
                   <div className="font-medium">{isZh ? "OAuth 授权已完成" : "OAuth Authorization Completed"}</div>
                   <div className="mt-1 text-xs text-emerald-600">
                     {isZh ? "授权信息已就绪，继续填写下面配置并创建即可。" : "Authorization is ready. Continue with the configuration below and create the provider."}
-                  </div>
-                </div>
-              ) : null}
-              {createResolvedAuthMode === "api_key" ? (
-                <div className="space-y-2">
-                  <FieldLabel>API Key</FieldLabel>
-                  <div className="relative">
-                    <Input
-                      placeholder="sk-..."
-                      type={showCreateApiKey ? "text" : "password"}
-                      value={form.api_key}
-                      className="pr-10"
-                      onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowCreateApiKey((prev) => !prev)}
-                      className="absolute top-1/2 right-3 -translate-y-1/2 cursor-pointer text-slate-400 hover:text-slate-600"
-                      aria-label={showCreateApiKey ? (isZh ? "隐藏 API Key" : "Hide API key") : (isZh ? "显示 API Key" : "Show API key")}
-                    >
-                      {showCreateApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                    </button>
                   </div>
                 </div>
               ) : null}
@@ -1841,6 +1829,72 @@ export default function ProvidersPage() {
                         onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
                       />
                     </div>
+                    {editingResolvedAuthMode === "oauth" ? (
+                      <div className="space-y-2">
+                        <FieldLabel>{isZh ? "OAuth 授权" : "OAuth Authorization"}</FieldLabel>
+                        <div className={`rounded-xl border px-4 py-3 text-sm ${editRequiresNewOAuthProvider ? "border-amber-200 bg-amber-50 text-amber-700" : "border-slate-200 bg-white text-slate-700"}`}>
+                          {editRequiresNewOAuthProvider ? (
+                            <p>{isZh ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道，请新建一个 OAuth Provider。" : "Existing providers cannot switch directly to an OAuth channel while editing. Create a new OAuth provider instead."}</p>
+                          ) : (
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <div className="font-medium text-slate-900">{isZh ? "当前授权状态" : "Authorization Status"}</div>
+                                  <div className="mt-1 text-xs text-slate-500 break-all">{editOAuthStatus?.resource_url || (isZh ? "已连接到当前 OAuth Provider" : "Connected to the current OAuth provider")}</div>
+                                </div>
+                                <Badge variant={editOAuthStatus?.status === "connected" ? "success" : editOAuthStatus?.status === "error" ? "danger" : "secondary"}>
+                                  {editOAuthStatusQuery.isLoading
+                                    ? (isZh ? "读取中" : "Loading")
+                                    : editOAuthStatus?.status || (isZh ? "未知" : "Unknown")}
+                                </Badge>
+                              </div>
+                              {editOAuthStatus?.last_error ? (
+                                <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">{editOAuthStatus.last_error}</p>
+                              ) : null}
+                              <div className="flex flex-wrap gap-2">
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  onClick={() => reconnectOAuthMut.mutate(p.id)}
+                                  disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
+                                >
+                                  {reconnectOAuthMut.isPending ? (isZh ? "刷新中..." : "Refreshing...") : (isZh ? "刷新授权" : "Refresh Auth")}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  onClick={() => logoutOAuthMut.mutate(p.id)}
+                                  disabled={logoutOAuthMut.isPending || reconnectOAuthMut.isPending}
+                                >
+                                  {logoutOAuthMut.isPending ? (isZh ? "断开中..." : "Disconnecting...") : (isZh ? "断开授权" : "Disconnect")}
+                                </Button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <FieldLabel>{isZh ? "API Key" : "API Key"}</FieldLabel>
+                        <div className="relative">
+                          <Input
+                            placeholder="sk-..."
+                            type={showEditApiKey ? "text" : "password"}
+                            value={editForm.api_key ?? ""}
+                            className="pr-10"
+                            onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowEditApiKey((prev) => !prev)}
+                            className="absolute top-1/2 right-3 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                            aria-label={showEditApiKey ? (isZh ? "隐藏 API Key" : "Hide API key") : (isZh ? "显示 API Key" : "Show API key")}
+                          >
+                            {showEditApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "默认协议" : "Default Protocol"}</FieldLabel>
                       <Select
@@ -1957,72 +2011,6 @@ export default function ProvidersPage() {
                             checked={Boolean(editForm.use_proxy)}
                             onCheckedChange={(checked) => setEditForm({ ...editForm, use_proxy: checked })}
                           />
-                        </div>
-                      </div>
-                    )}
-                    {editingResolvedAuthMode === "oauth" ? (
-                      <div className="space-y-2">
-                        <FieldLabel>{isZh ? "OAuth 授权" : "OAuth Authorization"}</FieldLabel>
-                        <div className={`rounded-xl border px-4 py-3 text-sm ${editRequiresNewOAuthProvider ? "border-amber-200 bg-amber-50 text-amber-700" : "border-slate-200 bg-white text-slate-700"}`}>
-                          {editRequiresNewOAuthProvider ? (
-                            <p>{isZh ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道，请新建一个 OAuth Provider。" : "Existing providers cannot switch directly to an OAuth channel while editing. Create a new OAuth provider instead."}</p>
-                          ) : (
-                            <div className="space-y-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div>
-                                  <div className="font-medium text-slate-900">{isZh ? "当前授权状态" : "Authorization Status"}</div>
-                                  <div className="mt-1 text-xs text-slate-500 break-all">{editOAuthStatus?.resource_url || (isZh ? "已连接到当前 OAuth Provider" : "Connected to the current OAuth provider")}</div>
-                                </div>
-                                <Badge variant={editOAuthStatus?.status === "connected" ? "success" : editOAuthStatus?.status === "error" ? "danger" : "secondary"}>
-                                  {editOAuthStatusQuery.isLoading
-                                    ? (isZh ? "读取中" : "Loading")
-                                    : editOAuthStatus?.status || (isZh ? "未知" : "Unknown")}
-                                </Badge>
-                              </div>
-                              {editOAuthStatus?.last_error ? (
-                                <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">{editOAuthStatus.last_error}</p>
-                              ) : null}
-                              <div className="flex flex-wrap gap-2">
-                                <Button
-                                  type="button"
-                                  variant="secondary"
-                                  onClick={() => reconnectOAuthMut.mutate(p.id)}
-                                  disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
-                                >
-                                  {reconnectOAuthMut.isPending ? (isZh ? "刷新中..." : "Refreshing...") : (isZh ? "刷新授权" : "Refresh Auth")}
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="secondary"
-                                  onClick={() => logoutOAuthMut.mutate(p.id)}
-                                  disabled={logoutOAuthMut.isPending || reconnectOAuthMut.isPending}
-                                >
-                                  {logoutOAuthMut.isPending ? (isZh ? "断开中..." : "Disconnecting...") : (isZh ? "断开授权" : "Disconnect")}
-                                </Button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <FieldLabel>{isZh ? "API Key" : "API Key"}</FieldLabel>
-                        <div className="relative">
-                          <Input
-                            placeholder="sk-..."
-                            type={showEditApiKey ? "text" : "password"}
-                            value={editForm.api_key ?? ""}
-                            className="pr-10"
-                            onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowEditApiKey((prev) => !prev)}
-                            className="absolute top-1/2 right-3 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
-                            aria-label={showEditApiKey ? (isZh ? "隐藏 API Key" : "Hide API key") : (isZh ? "显示 API Key" : "Show API key")}
-                          >
-                            {showEditApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                          </button>
                         </div>
                       </div>
                     )}
