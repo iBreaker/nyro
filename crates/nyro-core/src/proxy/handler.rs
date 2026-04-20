@@ -1369,6 +1369,7 @@ async fn handle_non_stream_via_upstream_stream(
                 &provider.name, 502, start.elapsed().as_millis() as f64,
                 TokenUsage::default(), false, false,
                 Some(e.to_string()), None,
+                LogExtras::default(),
             );
             return error_response(502, &format!("upstream error: {e}"));
         }
@@ -1387,6 +1388,7 @@ async fn handle_non_stream_via_upstream_stream(
             &provider.name, status as i32, start.elapsed().as_millis() as f64,
             TokenUsage::default(), false, false,
             Some(err_body.to_string()), None,
+            LogExtras::default(),
         );
         return (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1409,6 +1411,7 @@ async fn handle_non_stream_via_upstream_stream(
                     &provider.name, 502, start.elapsed().as_millis() as f64,
                     TokenUsage::default(), false, false,
                     Some(format!("stream read error: {e}")), None,
+                    LogExtras::default(),
                 );
                 return error_response(502, &format!("upstream stream error: {e}"));
             }
@@ -1450,6 +1453,7 @@ async fn handle_non_stream_via_upstream_stream(
         api_key_id,
         &provider.name, status as i32, start.elapsed().as_millis() as f64,
         usage.clone(), false, is_tool, None, response_preview,
+        LogExtras::default(),
     );
 
     let mut response = (
