@@ -537,6 +537,7 @@ impl AdminService {
         let provider = match self.sync_provider_runtime_fields(&provider, &credential).await {
             Ok(provider) => provider,
             Err(error) => {
+                let _ = self.gw.storage.oauth_credentials().delete(&provider.id).await;
                 self.restore_auth_session_record(session).await?;
                 return Err(error);
             }
@@ -1821,6 +1822,27 @@ impl AdminService {
             anyhow::bail!("no auth driver found for key: {driver_key}");
         };
 
+        // CAS lock: transition connected → refreshing to prevent concurrent refresh
+        let oauth_store = self.gw.storage.oauth_credentials();
+        let locked = oauth_store
+            .try_begin_refresh(&provider.id, oauth_cred.status_version)
+            .await?;
+        if locked.is_none() {
+            // Another caller is already refreshing — re-read and use whatever is there
+            let refreshed = oauth_store.get(&provider.id).await?
+                .ok_or_else(|| anyhow::anyhow!("provider oauth credential disappeared during refresh"))?;
+            let refreshed_token = refreshed.access_token.trim().to_string();
+            if !refreshed_token.is_empty() {
+                let cred = stored_credential_from_oauth(&refreshed, &driver_key);
+                let binding = driver.bind_runtime(provider, &cred)?;
+                return Ok(ResolvedProviderRuntime {
+                    access_token: refreshed_token,
+                    binding,
+                });
+            }
+            anyhow::bail!("concurrent refresh in progress but no valid token available");
+        }
+
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let bundle = match driver
             .refresh(
@@ -1835,7 +1857,7 @@ impl AdminService {
         {
             Ok(bundle) => bundle,
             Err(error) => {
-                let _ = self.gw.storage.oauth_credentials()
+                let _ = oauth_store
                     .fail_refresh(&provider.id, &error.to_string())
                     .await;
                 return Err(error.context("refresh oauth access token"));
