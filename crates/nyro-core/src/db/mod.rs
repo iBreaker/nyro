@@ -451,8 +451,10 @@ async fn migrate_oauth_credentials_from_providers(pool: &SqlitePool) -> anyhow::
         SELECT id, COALESCE(access_token, ''), refresh_token, expires_at, 'connected'
         FROM providers
         WHERE auth_mode = 'oauth'
-          AND access_token IS NOT NULL
-          AND access_token != ''
+          AND (
+            (access_token IS NOT NULL AND access_token != '')
+            OR (refresh_token IS NOT NULL AND refresh_token != '')
+          )
         "#,
     )
     .execute(pool)
