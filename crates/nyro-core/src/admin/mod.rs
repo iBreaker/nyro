@@ -2506,12 +2506,22 @@ fn sync_runtime_protocol_endpoints(provider: &Provider, base_url: &str) -> anyho
         return Ok(serde_json::to_string(&endpoints)?);
     }
 
-    for protocol in [provider.protocol.trim(), provider.effective_default_protocol().trim()] {
-        if protocol.is_empty() {
-            continue;
-        }
+    let default_protocol = provider.effective_default_protocol().trim().to_string();
+    let legacy_protocol = provider.protocol.trim().to_string();
+
+    // If default_protocol differs from the legacy protocol field, the provider
+    // has been upgraded (e.g. openai → openai_responses via OAuth bind).
+    // Remove the stale legacy entry so only the current protocol remains.
+    if !default_protocol.is_empty()
+        && !legacy_protocol.is_empty()
+        && default_protocol != legacy_protocol
+    {
+        endpoints.remove(&legacy_protocol);
+    }
+
+    if !default_protocol.is_empty() {
         endpoints
-            .entry(protocol.to_string())
+            .entry(default_protocol)
             .and_modify(|entry| entry.base_url = runtime_base_url.to_string())
             .or_insert_with(|| ProtocolEndpointEntry {
                 base_url: runtime_base_url.to_string(),
