@@ -1970,7 +1970,7 @@ impl AdminService {
                 None => continue,
             };
 
-            match self.resolve_provider_runtime(&provider).await {
+            match self.proactive_refresh_credential(&provider, &cred).await {
                 Ok(_) => refreshed += 1,
                 Err(error) => tracing::warn!(
                     "background oauth refresh failed for provider {} ({}): {}",
@@ -1982,6 +1982,75 @@ impl AdminService {
         }
 
         Ok(refreshed)
+    }
+
+    /// Proactively refresh an OAuth credential that is approaching expiry.
+    /// Unlike `resolve_provider_runtime` (which skips refresh if the token is
+    /// still valid), this always attempts to obtain a new token.
+    async fn proactive_refresh_credential(
+        &self,
+        provider: &Provider,
+        cred: &OAuthCredential,
+    ) -> anyhow::Result<()> {
+        let driver_key = if cred.driver_key.is_empty() {
+            provider.vendor.as_deref().map(auth::normalize_driver_key).unwrap_or_default()
+        } else {
+            cred.driver_key.clone()
+        };
+
+        let credential = stored_credential_from_oauth(cred, &driver_key);
+
+        let Some(driver) = auth::build_driver(&driver_key) else {
+            anyhow::bail!("no auth driver found for key: {driver_key}");
+        };
+
+        // CAS lock: transition connected → refreshing
+        let oauth_store = self.gw.storage.oauth_credentials();
+        let locked = oauth_store
+            .try_begin_refresh(&provider.id, cred.status_version)
+            .await?;
+        if locked.is_none() {
+            // Another caller is already refreshing — skip
+            return Ok(());
+        }
+
+        let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+        let bundle = match driver
+            .refresh(
+                &credential,
+                RefreshAuthContext {
+                    use_proxy: provider.use_proxy,
+                    http_client: Some(client),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                let _ = oauth_store
+                    .fail_refresh(&provider.id, &error.to_string())
+                    .await;
+                return Err(error.context("proactive oauth refresh"));
+            }
+        };
+
+        let refreshed_credential = stored_credential_from_bundle(
+            &driver_key,
+            driver.metadata().scheme.as_str(),
+            &bundle,
+        );
+        let credential_input = upsert_credential_from_bundle(
+            &driver_key,
+            driver.metadata().scheme.as_str(),
+            &bundle,
+        );
+        oauth_store
+            .complete_refresh(&provider.id, credential_input)
+            .await?;
+        self.sync_provider_runtime_fields(provider, &refreshed_credential)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn cleanup_auth_sessions(&self) -> anyhow::Result<usize> {
