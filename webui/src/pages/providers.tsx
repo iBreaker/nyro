@@ -2010,15 +2010,17 @@ export default function ProvidersPage() {
                       </ToggleGroup>
                     </div>
                     {editingResolvedAuthMode === "oauth" ? (
-                      <div className="col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
+                      <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected"}>
+                        <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+                          <div className="flex items-center gap-2">
                             <p className="text-sm font-semibold text-slate-800">
                               {isZh ? "OAuth 授权" : "OAuth Authorization"}
                             </p>
-                            <p className="mt-1 text-xs text-slate-500">
-                              {isZh ? "查看并管理当前 Provider 的 OAuth 授权状态。" : "View and manage the OAuth authorization of this provider."}
-                            </p>
+                            {editOAuthStatus?.status === "connected" && (
+                              <span className="text-xs text-slate-400">
+                                {isZh ? "（点击展开）" : "(click to expand)"}
+                              </span>
+                            )}
                           </div>
                           <Badge variant={
                             editOAuthStatus?.status === "connected" ? "success"
@@ -2028,7 +2030,8 @@ export default function ProvidersPage() {
                               ? (isZh ? "读取中" : "Loading")
                               : editOAuthStatus?.status || (isZh ? "未知" : "Unknown")}
                           </Badge>
-                        </div>
+                        </summary>
+                        <div className="px-4 pb-4">
                         {editRequiresNewOAuthProvider ? (
                           <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
                             <span>{isZh ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道。" : "Existing providers cannot switch directly to an OAuth channel while editing."}</span>
@@ -2184,7 +2187,8 @@ export default function ProvidersPage() {
                             )}
                           </div>
                         )}
-                      </div>
+                        </div>
+                      </details>
                     ) : null}
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "名称" : "Name"}</FieldLabel>
