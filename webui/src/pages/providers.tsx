@@ -463,8 +463,19 @@ export default function ProvidersPage() {
   const [createOAuthStatus, setCreateOAuthStatus] = useState<OAuthSessionStatusData | null>(null);
   const [createOAuthBusy, setCreateOAuthBusy] = useState(false);
   const [createOAuthCallbackUrl, setCreateOAuthCallbackUrl] = useState("");
+  const [createOAuthCallbackError, setCreateOAuthCallbackError] = useState("");
   const [createOAuthCode, setCreateOAuthCode] = useState("");
+  const [createOAuthCopied, setCreateOAuthCopied] = useState(false);
+  const [createOAuthCopyFailed, setCreateOAuthCopyFailed] = useState(false);
   const createOAuthPollerRef = useRef<number | null>(null);
+  // Edit-mode OAuth re-authorization states
+  const [editOAuthSession, setEditOAuthSession] = useState<OAuthSessionInitData | null>(null);
+  const [editOAuthSessionStatus, setEditOAuthSessionStatus] = useState<OAuthSessionStatusData | null>(null);
+  const [editOAuthBusy, setEditOAuthBusy] = useState(false);
+  const [editOAuthCallbackUrl, setEditOAuthCallbackUrl] = useState("");
+  const [editOAuthCode, setEditOAuthCode] = useState("");
+  const [showEditReauth, setShowEditReauth] = useState(false);
+  const editOAuthPollerRef = useRef<number | null>(null);
   const activeTestRunRef = useRef(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -663,7 +674,10 @@ export default function ProvidersPage() {
     setCreateOAuthStatus(null);
     setCreateOAuthBusy(false);
     setCreateOAuthCallbackUrl("");
+    setCreateOAuthCallbackError("");
     setCreateOAuthCode("");
+    setCreateOAuthCopied(false);
+    setCreateOAuthCopyFailed(false);
     if (cancelRemote && sessionId) {
       void backend("cancel_oauth_session", { sessionId }).catch(() => {
         // Best-effort cleanup only.
@@ -709,16 +723,8 @@ export default function ProvidersPage() {
         };
       });
 
-      const authUrl = init.auth_url || init.verification_uri_complete;
-      if (authUrl) {
-        void openExternalUrl(authUrl).catch((error) => {
-          setCreateOAuthStatus((prev) => prev ?? {
-            status: "error",
-            code: "OAUTH_OPEN_BROWSER_FAILED",
-            message: normalizeErrorMessage(error),
-          });
-        });
-      }
+      // Don't auto-open the browser — let the user click "Open Authorization Page"
+      // after reviewing the URL. This avoids surprising pop-ups.
 
       if (init.requires_manual_code) {
         setCreateOAuthBusy(false);
@@ -854,6 +860,173 @@ export default function ProvidersPage() {
       });
     } finally {
       setCreateOAuthBusy(false);
+    }
+  }
+
+  // --- Edit-mode OAuth re-authorization ---
+
+  function stopEditOAuthPolling() {
+    if (editOAuthPollerRef.current != null) {
+      window.clearInterval(editOAuthPollerRef.current);
+      editOAuthPollerRef.current = null;
+    }
+  }
+
+  function resetEditOAuthState() {
+    const sessionId = editOAuthSession?.session_id;
+    stopEditOAuthPolling();
+    setEditOAuthSession(null);
+    setEditOAuthSessionStatus(null);
+    setEditOAuthBusy(false);
+    setEditOAuthCallbackUrl("");
+    setEditOAuthCode("");
+    if (sessionId) {
+      void backend("cancel_oauth_session", { sessionId }).catch(() => {});
+    }
+  }
+
+  async function startEditReauth(providerId: string, vendor: string, useProxy: boolean) {
+    resetEditOAuthState();
+    setShowEditReauth(true);
+    setEditOAuthBusy(true);
+    try {
+      const init = await backend<OAuthSessionInitData>("init_oauth_session", {
+        vendor,
+        useProxy,
+      });
+      setEditOAuthSession(init);
+      setEditOAuthSessionStatus({
+        status: "pending",
+        scheme: init.scheme,
+        auth_url: init.auth_url,
+        requires_manual_code: init.requires_manual_code,
+        expires_in: init.expires_in,
+        interval: init.interval,
+        user_code: init.user_code,
+        verification_uri_complete: init.verification_uri_complete,
+      });
+
+      const authUrl = init.auth_url || init.verification_uri_complete;
+      if (authUrl) {
+        void openExternalUrl(authUrl).catch(() => {});
+      }
+
+      if (init.requires_manual_code) {
+        setEditOAuthBusy(false);
+        return;
+      }
+
+      const intervalMs = Math.max(2, Number(init.interval) || 2) * 1000;
+      editOAuthPollerRef.current = window.setInterval(async () => {
+        try {
+          const status = await backend<OAuthSessionStatusData>("get_oauth_session_status", {
+            sessionId: init.session_id,
+          });
+          setEditOAuthSessionStatus(status);
+          if (status.status === "pending") {
+            if ((status.expires_in ?? 0) <= 0) {
+              stopEditOAuthPolling();
+              setEditOAuthBusy(false);
+              setEditOAuthSessionStatus({
+                status: "error",
+                code: "OAUTH_TIMEOUT",
+                message: isZh ? "授权会话已超时，请重新发起。" : "OAuth session timed out.",
+              });
+            }
+            return;
+          }
+          stopEditOAuthPolling();
+          setEditOAuthBusy(false);
+          if (status.status === "ready") {
+            // Bind the session to the existing provider
+            try {
+              await backend("bind_provider_oauth", {
+                providerId,
+                sessionId: init.session_id,
+              });
+              qc.invalidateQueries({ queryKey: ["providers"] });
+              qc.invalidateQueries({ queryKey: ["provider-oauth-status", providerId] });
+              setShowEditReauth(false);
+              resetEditOAuthState();
+            } catch (error) {
+              setEditOAuthSessionStatus({
+                status: "error",
+                code: "OAUTH_BIND_FAILED",
+                message: normalizeErrorMessage(error),
+              });
+            }
+          }
+        } catch (error) {
+          stopEditOAuthPolling();
+          setEditOAuthBusy(false);
+          setEditOAuthSessionStatus({
+            status: "error",
+            code: "OAUTH_STATUS_FAILED",
+            message: normalizeErrorMessage(error),
+          });
+        }
+      }, intervalMs);
+    } catch (error) {
+      setEditOAuthBusy(false);
+      setEditOAuthSessionStatus({
+        status: "error",
+        code: "OAUTH_INIT_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    }
+  }
+
+  async function completeEditReauth(providerId: string) {
+    const sessionId = editOAuthSession?.session_id;
+    if (!sessionId) return;
+
+    const callbackUrl = editOAuthCallbackUrl.trim();
+    const code = editOAuthCode.trim();
+    if (!callbackUrl && !code) {
+      setEditOAuthSessionStatus({
+        status: "error",
+        code: "OAUTH_INPUT_REQUIRED",
+        message: isZh
+          ? "请粘贴完整回调地址，或单独填写授权码。"
+          : "Paste the full callback URL or enter the authorization code.",
+      });
+      return;
+    }
+
+    setEditOAuthBusy(true);
+    try {
+      const status = await backend<OAuthSessionStatusData>("complete_oauth_session", {
+        sessionId,
+        callbackUrl: callbackUrl || undefined,
+        code: code || undefined,
+      });
+      setEditOAuthSessionStatus(status);
+      if (status.status === "ready") {
+        try {
+          await backend("bind_provider_oauth", {
+            providerId,
+            sessionId,
+          });
+          qc.invalidateQueries({ queryKey: ["providers"] });
+          qc.invalidateQueries({ queryKey: ["provider-oauth-status", providerId] });
+          setShowEditReauth(false);
+          resetEditOAuthState();
+        } catch (error) {
+          setEditOAuthSessionStatus({
+            status: "error",
+            code: "OAUTH_BIND_FAILED",
+            message: normalizeErrorMessage(error),
+          });
+        }
+      }
+    } catch (error) {
+      setEditOAuthSessionStatus({
+        status: "error",
+        code: "OAUTH_COMPLETE_FAILED",
+        message: normalizeErrorMessage(error),
+      });
+    } finally {
+      setEditOAuthBusy(false);
     }
   }
 
@@ -1327,25 +1500,64 @@ export default function ProvidersPage() {
                       <p className="mt-2 text-xs text-slate-500">
                         {isZh ? "先打开浏览器完成登录授权。" : "Open the browser and complete sign-in first."}
                       </p>
-                      {createOAuthSession ? (
-                        <div className="mt-3 rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600">
-                          <div className="font-medium text-slate-700">{isZh ? "授权链接" : "Authorization URL"}</div>
-                          <div className="mt-1 break-all">{createOAuthSession.auth_url || createOAuthSession.verification_uri_complete}</div>
-                        </div>
-                      ) : null}
                       <div className="mt-3 flex flex-wrap gap-2">
-                        <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset}>
-                          {createOAuthBusy ? (isZh ? "打开中..." : "Opening...") : (isZh ? "开始授权" : "Start Authorization")}
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          onClick={reopenCreateOAuthPage}
-                          disabled={!createOAuthSession}
-                        >
-                          {isZh ? "重新打开" : "Open Again"}
-                        </Button>
+                        {!createOAuthSession ? (
+                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset}>
+                            {createOAuthBusy ? (isZh ? "初始化中..." : "Initializing...") : (isZh ? "开始授权" : "Start Authorization")}
+                          </Button>
+                        ) : (
+                          <>
+                            <Button type="button" onClick={reopenCreateOAuthPage}>
+                              {isZh ? "打开授权页" : "Open Authorization Page"}
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              onClick={async () => {
+                                const url = createOAuthSession.auth_url || createOAuthSession.verification_uri_complete || "";
+                                let ok = false;
+                                try {
+                                  await navigator.clipboard.writeText(url);
+                                  ok = true;
+                                } catch {
+                                  // fallback for HTTP
+                                  try {
+                                    const ta = document.createElement("textarea");
+                                    ta.value = url;
+                                    ta.style.position = "fixed";
+                                    ta.style.opacity = "0";
+                                    document.body.appendChild(ta);
+                                    ta.select();
+                                    ok = document.execCommand("copy");
+                                    document.body.removeChild(ta);
+                                  } catch { /* ignore */ }
+                                }
+                                if (ok) {
+                                  setCreateOAuthCopyFailed(false);
+                                  setCreateOAuthCopied(true);
+                                } else {
+                                  setCreateOAuthCopyFailed(true);
+                                }
+                              }}
+                            >
+                              {createOAuthCopied ? (isZh ? "已复制" : "Copied!") : (isZh ? "复制链接" : "Copy Link")}
+                            </Button>
+                          </>
+                        )}
                       </div>
+                      {createOAuthCopied && (
+                        <p className="mt-2 text-xs text-emerald-600">
+                          {isZh ? "链接已复制，请在浏览器中打开并完成授权登录。" : "Link copied. Please open it in your browser and complete the authorization."}
+                        </p>
+                      )}
+                      {createOAuthCopyFailed && createOAuthSession && (
+                        <div className="mt-2 space-y-1">
+                          <p className="text-xs text-rose-600">{isZh ? "复制失败，请手动复制以下链接并在浏览器中打开完成授权：" : "Copy failed. Please manually copy the link below and open it in your browser to authorize:"}</p>
+                          <div className="rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600 break-all select-all">
+                            {createOAuthSession.auth_url || createOAuthSession.verification_uri_complete}
+                          </div>
+                        </div>
+                      )}
                     </div>
                     <div className={`rounded-lg border p-3 ${createOAuthStatus?.status === "error" ? "border-rose-200 bg-rose-50" : createOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
                       <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
@@ -1364,16 +1576,40 @@ export default function ProvidersPage() {
                             onChange={(e) => {
                               const url = e.target.value;
                               setCreateOAuthCallbackUrl(url);
+                              setCreateOAuthCallbackError("");
+                              if (!url.trim()) return;
                               try {
                                 const parsed = new URL(url);
                                 const code = parsed.searchParams.get("code");
-                                if (code) setCreateOAuthCode(code);
+                                if (code) {
+                                  setCreateOAuthCode(code);
+                                } else if (parsed.searchParams.has("error")) {
+                                  const desc = parsed.searchParams.get("error_description") || parsed.searchParams.get("error") || "";
+                                  setCreateOAuthCallbackError(
+                                    isZh
+                                      ? `授权失败：${desc || "回调中包含 error 参数"}`
+                                      : `Authorization failed: ${desc || "callback contains error parameter"}`,
+                                  );
+                                } else {
+                                  setCreateOAuthCallbackError(
+                                    isZh
+                                      ? "回调地址中没有找到 code 参数，请确认粘贴了正确的回调地址。"
+                                      : "No code parameter found in URL. Please confirm you pasted the correct callback URL.",
+                                  );
+                                }
                               } catch {
-                                // not a valid URL yet, ignore
+                                setCreateOAuthCallbackError(
+                                  isZh
+                                    ? "输入的内容不是有效的 URL，请粘贴完整的回调地址。"
+                                    : "Input is not a valid URL. Please paste the complete callback URL.",
+                                );
                               }
                             }}
                             disabled={!createOAuthSession || createOAuthBusy}
                           />
+                          {createOAuthCallbackError && (
+                            <p className="text-xs text-rose-600">{createOAuthCallbackError}</p>
+                          )}
                         </div>
                         <div className="space-y-2">
                           <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
@@ -1388,7 +1624,7 @@ export default function ProvidersPage() {
                           <Button
                             type="button"
                             onClick={completeCreateOAuth}
-                            disabled={createOAuthBusy || !createOAuthSession}
+                            disabled={createOAuthBusy || !createOAuthSession || !!createOAuthCallbackError}
                           >
                             {createOAuthBusy ? (isZh ? "提交中..." : "Submitting...") : (isZh ? "提交结果" : "Submit")}
                           </Button>
@@ -1435,11 +1671,11 @@ export default function ProvidersPage() {
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
               </div>
+              {createResolvedAuthMode !== "oauth" && (
               <div className="space-y-2">
                 <FieldLabel>{isZh ? "默认协议" : "Default Protocol"}</FieldLabel>
                 <Select
                   value={form.protocol}
-                  disabled={createResolvedAuthMode === "oauth"}
                   onValueChange={(value) => {
                     const nextProtocol = value as ProviderProtocol;
                     const config = selectedPreset
@@ -1480,6 +1716,8 @@ export default function ProvidersPage() {
                   </SelectContent>
                 </Select>
               </div>
+              )}
+              {createResolvedAuthMode !== "oauth" && (
               <div className="col-span-2 space-y-2">
                 <FieldLabel>{isZh ? "协议端点映射" : "Protocol Endpoints"}</FieldLabel>
                 <div className="space-y-2 rounded-xl border border-slate-200 bg-white p-3">
@@ -1487,7 +1725,6 @@ export default function ProvidersPage() {
                     <div key={`create-endpoint-${index}`} className="grid grid-cols-[180px_minmax(0,1fr)_32px] gap-2">
                       <Select
                         value={row.protocol}
-                        disabled={createResolvedAuthMode === "oauth"}
                         onValueChange={(value) => {
                           const nextProtocol = value as ProviderProtocol;
                           setCreateEndpointRows((prev) =>
@@ -1509,7 +1746,6 @@ export default function ProvidersPage() {
                       <Input
                         placeholder={isZh ? "输入上游基础地址" : "Enter upstream base URL"}
                         value={row.base_url}
-                        disabled={createResolvedAuthMode === "oauth"}
                         onChange={(e) =>
                           setCreateEndpointRows((prev) =>
                             prev.map((item, i) => (i === index ? { ...item, base_url: e.target.value } : item)),
@@ -1518,7 +1754,7 @@ export default function ProvidersPage() {
                       />
                       <button
                         type="button"
-                        disabled={createResolvedAuthMode === "oauth" || createEndpointRows.length <= 1}
+                        disabled={createEndpointRows.length <= 1}
                         onClick={() =>
                           setCreateEndpointRows((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== index)))
                         }
@@ -1532,7 +1768,6 @@ export default function ProvidersPage() {
                     type="button"
                     variant="secondary"
                     className="w-full"
-                    disabled={createResolvedAuthMode === "oauth"}
                     onClick={() =>
                       setCreateEndpointRows((prev) => [...prev, { protocol: "openai", base_url: "" }])
                     }
@@ -1542,6 +1777,7 @@ export default function ProvidersPage() {
                   </Button>
                 </div>
               </div>
+              )}
               {isGlobalProxyEnabled && (
                 <div className="space-y-2">
                   <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
@@ -1578,6 +1814,8 @@ export default function ProvidersPage() {
                   </div>
                 </div>
               )}
+              {createResolvedAuthMode !== "oauth" && (
+              <>
               <div className="space-y-2">
                 <FieldLabel
                   info={
@@ -1591,7 +1829,6 @@ export default function ProvidersPage() {
                 <Input
                   placeholder={isZh ? "可选，支持 https:// 或 ai://models.dev/..." : "Optional, supports https:// or ai://models.dev/..."}
                   value={form.models_source ?? ""}
-                  disabled={createResolvedAuthMode === "oauth"}
                   onChange={(e) => setForm({ ...form, models_source: e.target.value })}
                 />
               </div>
@@ -1608,10 +1845,11 @@ export default function ProvidersPage() {
                 <Input
                   placeholder={isZh ? "可选，支持 https:// 或 ai://models.dev/..." : "Optional, supports https:// or ai://models.dev/..."}
                   value={form.capabilities_source ?? ""}
-                  disabled={createResolvedAuthMode === "oauth"}
                   onChange={(e) => setForm({ ...form, capabilities_source: e.target.value })}
                 />
               </div>
+              </>
+              )}
             </div>
               <div className="flex gap-3">
                 <Button
@@ -1830,49 +2068,55 @@ export default function ProvidersPage() {
                       </ToggleGroup>
                     </div>
                     {editingResolvedAuthMode === "oauth" ? (
-                      <div className="col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
+                      <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected"}>
+                        <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+                          <div className="flex items-center gap-2">
                             <p className="text-sm font-semibold text-slate-800">
                               {isZh ? "OAuth 授权" : "OAuth Authorization"}
                             </p>
-                            <p className="mt-1 text-xs text-slate-500">
-                              {isZh ? "查看并管理当前 Provider 的 OAuth 授权状态。" : "View and manage the OAuth authorization of this provider."}
-                            </p>
+                            {editOAuthStatus?.status === "connected" && (
+                              <span className="text-xs text-slate-400">
+                                {isZh ? "（点击展开）" : "(click to expand)"}
+                              </span>
+                            )}
                           </div>
-                          <Badge variant={editOAuthStatus?.status === "connected" ? "success" : editOAuthStatus?.status === "error" ? "danger" : "secondary"}>
+                          <Badge variant={
+                            editOAuthStatus?.status === "connected" ? "success"
+                              : editOAuthStatus?.status === "error" ? "danger" : "secondary"
+                          }>
                             {editOAuthStatusQuery.isLoading
                               ? (isZh ? "读取中" : "Loading")
                               : editOAuthStatus?.status || (isZh ? "未知" : "Unknown")}
                           </Badge>
-                        </div>
+                        </summary>
+                        <div className="px-4 pb-4">
                         {editRequiresNewOAuthProvider ? (
                           <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-                            {isZh ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道，请新建一个 OAuth Provider。" : "Existing providers cannot switch directly to an OAuth channel while editing. Create a new OAuth provider instead."}
+                            <span>{isZh ? "已有 Provider 不能在编辑时直接切到 OAuth 渠道。" : "Existing providers cannot switch directly to an OAuth channel while editing."}</span>
+                            <button
+                              type="button"
+                              className="ml-1 font-medium text-amber-800 underline hover:text-amber-900 cursor-pointer"
+                              onClick={() => {
+                                setEditingId(null);
+                                setShowForm(true);
+                                handlePresetChange("openai");
+                              }}
+                            >
+                              {isZh ? "新建 OAuth Provider" : "Create new OAuth Provider"}
+                            </button>
                           </div>
-                        ) : (
+                        ) : editOAuthStatus?.status === "connected" ? (
                           <div className="mt-4 space-y-3">
                             <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
                               <div className="text-xs font-medium text-slate-700">
                                 {isZh ? "当前授权状态" : "Authorization Status"}
                               </div>
-                              <div className="mt-1 text-xs text-slate-500 break-all">
-                                {editOAuthStatusQuery.isLoading
-                                  ? (isZh ? "正在读取授权状态..." : "Loading authorization status...")
-                                  : editOAuthStatus?.status === "connected"
-                                    ? (isZh ? "授权有效，可正常使用当前 Provider。" : "Authorization is valid. The provider is ready to use.")
-                                    : editOAuthStatus?.status === "error"
-                                      ? (isZh ? "授权出现错误，请刷新或重新授权。" : "Authorization encountered an error. Please refresh or re-authorize.")
-                                      : editOAuthStatus?.status === "pending"
-                                        ? (isZh ? "授权正在进行或待完成。" : "Authorization is in progress or pending.")
-                                        : editOAuthStatus?.status
-                                          ? (isZh ? `当前状态：${editOAuthStatus.status}` : `Current status: ${editOAuthStatus.status}`)
-                                          : (isZh ? "未知的授权状态。" : "Unknown authorization status.")}
+                              <div className="mt-1 text-xs text-slate-500">
+                                {editOAuthStatus?.expires_at && new Date(editOAuthStatus.expires_at).getTime() < Date.now()
+                                  ? (isZh ? "Access Token 已过期，请点击续期。" : "Access token has expired. Please renew.")
+                                  : (isZh ? "授权有效，可正常使用当前 Provider。" : "Authorization is valid. The provider is ready to use.")}
                               </div>
                             </div>
-                            {editOAuthStatus?.last_error ? (
-                              <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">{editOAuthStatus.last_error}</p>
-                            ) : null}
                             <div className="flex flex-wrap gap-2">
                               <Button
                                 type="button"
@@ -1880,7 +2124,7 @@ export default function ProvidersPage() {
                                 onClick={() => reconnectOAuthMut.mutate(p.id)}
                                 disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
                               >
-                                {reconnectOAuthMut.isPending ? (isZh ? "刷新中..." : "Refreshing...") : (isZh ? "刷新授权" : "Refresh Auth")}
+                                {reconnectOAuthMut.isPending ? (isZh ? "续期中..." : "Renewing...") : (isZh ? "续期 Token" : "Renew Token")}
                               </Button>
                               <Button
                                 type="button"
@@ -1892,8 +2136,117 @@ export default function ProvidersPage() {
                               </Button>
                             </div>
                           </div>
+                        ) : (
+                          <div className="mt-4 space-y-3">
+                            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                              <div className="text-xs font-medium text-amber-700">
+                                {isZh ? "当前授权状态" : "Authorization Status"}
+                              </div>
+                              <div className="mt-1 text-xs text-amber-600">
+                                {editOAuthStatus?.status === "error"
+                                  ? (isZh ? "授权失败（Refresh Token 可能已失效），请重新授权。" : "Authorization failed (refresh token may have expired). Please re-authorize.")
+                                  : (isZh ? "未授权，请进行 OAuth 授权。" : "Not authorized. Please complete OAuth authorization.")}
+                              </div>
+                            </div>
+                            {editOAuthStatus?.last_error ? (
+                              <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600">{editOAuthStatus.last_error}</p>
+                            ) : null}
+                            {!showEditReauth ? (
+                              <Button
+                                type="button"
+                                onClick={() => startEditReauth(p.id, p.vendor || p.preset_key || "", p.use_proxy)}
+                              >
+                                {isZh ? "开始授权" : "Start Authorization"}
+                              </Button>
+                            ) : (
+                              <div className="space-y-3">
+                                <div className="grid gap-3 md:grid-cols-2">
+                                  <div className={`rounded-lg border p-3 ${editOAuthSession ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-white"}`}>
+                                    <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                                      <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${editOAuthSession ? "bg-emerald-600 text-white" : "bg-slate-200 text-slate-700"}`}>1</span>
+                                      <span>{isZh ? "打开授权页" : "Open Authorization Page"}</span>
+                                    </div>
+                                    <p className="mt-2 text-xs text-slate-500">
+                                      {isZh ? "先打开浏览器完成登录授权。" : "Open the browser and complete sign-in first."}
+                                    </p>
+                                    {editOAuthSession ? (
+                                      <div className="mt-3 rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600">
+                                        <div className="font-medium text-slate-700">{isZh ? "授权链接" : "Authorization URL"}</div>
+                                        <div className="mt-1 break-all">{editOAuthSession.auth_url || editOAuthSession.verification_uri_complete}</div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  <div className={`rounded-lg border p-3 ${editOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
+                                    <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
+                                      <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${editOAuthSession ? "bg-sky-600 text-white" : "bg-slate-200 text-slate-700"}`}>2</span>
+                                      <span>{isZh ? "粘贴回调结果" : "Paste Callback Result"}</span>
+                                    </div>
+                                    <p className="mt-2 text-xs text-slate-500">
+                                      {isZh ? "浏览器授权完成后，把回调地址或授权码粘贴到这里。" : "After browser authorization, paste the callback URL or authorization code here."}
+                                    </p>
+                                    <div className="mt-3 space-y-3">
+                                      <div className="space-y-2">
+                                        <FieldLabel>{isZh ? "回调地址" : "Callback URL"}</FieldLabel>
+                                        <Input
+                                          placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
+                                          value={editOAuthCallbackUrl}
+                                          onChange={(e) => {
+                                            const url = e.target.value;
+                                            setEditOAuthCallbackUrl(url);
+                                            try {
+                                              const parsed = new URL(url);
+                                              const codeParam = parsed.searchParams.get("code");
+                                              if (codeParam) setEditOAuthCode(codeParam);
+                                            } catch {
+                                              // not a valid URL yet
+                                            }
+                                          }}
+                                          disabled={!editOAuthSession || editOAuthBusy}
+                                        />
+                                      </div>
+                                      <div className="space-y-2">
+                                        <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
+                                        <Input
+                                          placeholder="code..."
+                                          value={editOAuthCode}
+                                          onChange={(e) => setEditOAuthCode(e.target.value)}
+                                          disabled={!editOAuthSession || editOAuthBusy}
+                                        />
+                                      </div>
+                                      <div className="flex flex-wrap gap-2">
+                                        <Button
+                                          type="button"
+                                          onClick={() => completeEditReauth(p.id)}
+                                          disabled={editOAuthBusy || !editOAuthSession}
+                                        >
+                                          {editOAuthBusy ? (isZh ? "提交中..." : "Submitting...") : (isZh ? "提交结果" : "Submit")}
+                                        </Button>
+                                        <Button
+                                          type="button"
+                                          variant="secondary"
+                                          onClick={() => { resetEditOAuthState(); setShowEditReauth(false); }}
+                                        >
+                                          {isZh ? "取消" : "Cancel"}
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                                {editOAuthSessionStatus?.status === "error" ? (
+                                  <p className="text-xs text-rose-600">{editOAuthSessionStatus.code}: {editOAuthSessionStatus.message}</p>
+                                ) : editOAuthSession ? (
+                                  <p className="text-xs text-slate-500">
+                                    {editOAuthSession.requires_manual_code
+                                      ? (isZh ? "完成步骤 1 后，再执行步骤 2。" : "Finish step 1, then complete step 2.")
+                                      : (isZh ? "等待浏览器完成授权。" : "Waiting for browser authorization to complete.")}
+                                  </p>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
                         )}
-                      </div>
+                        </div>
+                      </details>
                     ) : null}
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "名称" : "Name"}</FieldLabel>
@@ -2169,6 +2522,11 @@ export default function ProvidersPage() {
                         {isGlobalProxyEnabled && p.use_proxy && (
                           <Badge variant="success" className="connect-label-badge">
                             {isZh ? "本地代理" : "Proxy"}
+                          </Badge>
+                        )}
+                        {normalizeAuthMode(p.auth_mode) === "oauth" && (
+                          <Badge variant="secondary" className="connect-label-badge bg-sky-50 text-sky-700">
+                            OAuth
                           </Badge>
                         )}
                         {!p.is_enabled && (
