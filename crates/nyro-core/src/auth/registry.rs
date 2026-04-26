@@ -6,9 +6,8 @@ use crate::auth::types::{AuthDriver, AuthDriverMetadata};
 pub fn normalize_driver_key(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "openai-oauth" | "openai_oauth" | "openai" | "codex-cli" | "codex" => "codex".to_string(),
-        "claude-code" | "claude_code" | "claude-oauth" | "claude_oauth" | "claude" => {
-            "claude-code".to_string()
-        }
+        "claude-code" | "claude_code" | "claude-oauth" | "claude_oauth" | "claude"
+        | "anthropic" => "claude-code".to_string(),
         other => other.to_string(),
     }
 }

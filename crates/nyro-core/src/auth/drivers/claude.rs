@@ -321,7 +321,8 @@ impl AuthDriver for ClaudeOAuthDriver {
         let config = Self::claude_code_config()?;
         let mut extra_headers = HashMap::new();
 
-        // Claude OAuth uses Bearer auth instead of x-api-key
+        // Claude OAuth tokens require Authorization: Bearer (not x-api-key)
+        // and the oauth-2025-04-20 beta flag.
         let access_token = credential
             .access_token
             .as_deref()
@@ -331,6 +332,14 @@ impl AuthDriver for ClaudeOAuthDriver {
         extra_headers.insert(
             "authorization".to_string(),
             format!("Bearer {access_token}"),
+        );
+        extra_headers.insert(
+            "anthropic-version".to_string(),
+            "2023-06-01".to_string(),
+        );
+        extra_headers.insert(
+            "anthropic-beta".to_string(),
+            "oauth-2025-04-20".to_string(),
         );
 
         let base_url_override = credential
@@ -446,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_runtime_sets_bearer_and_disables_default_auth() {
+    fn bind_runtime_sets_bearer_and_oauth_beta_and_disables_default_auth() {
         let provider = test_provider();
         let credential = StoredCredential {
             access_token: Some("my_token".into()),
@@ -454,6 +463,7 @@ mod tests {
         };
         let binding = ClaudeOAuthDriver.bind_runtime(&provider, &credential).unwrap();
         assert_eq!(binding.extra_headers.get("authorization").unwrap(), "Bearer my_token");
+        assert_eq!(binding.extra_headers.get("anthropic-beta").unwrap(), "oauth-2025-04-20");
         assert!(binding.disable_default_auth);
         assert!(binding.base_url_override.is_some());
     }
